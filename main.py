@@ -124,6 +124,38 @@ def simulate_drop(thing, simulation_time_s):
     return time_list, z_list, v_z_list
 
 
+
+# aero helper function 
+def reynolds_number(chord_m, vel_mps, nu=1.48e-5):
+    """
+    Calculate Reynolds number for an airfoil.
+
+    Parameters:
+        chord_m : float
+            Chord length in meters.
+        vel_mps : float
+            Freestream velocity in m/s.
+        nu : float
+            Kinematic viscosity of air in m^2/s.
+            Default is about sea-level air at ~15°C.
+
+    Returns:
+        float
+            Reynolds number.
+    """
+    return vel_mps * chord_m / nu
+
+
+# # Example:
+# chord_m = 0.20
+# vel_mps = 15
+
+# Re = reynolds_number(chord_m, vel_mps)
+# print(f"Re = {Re:.2e}")
+
+
+
+
 # -----------------------------
 # Stone vs feather
 # -----------------------------
