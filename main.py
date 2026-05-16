@@ -1,218 +1,443 @@
-import matplotlib.pyplot as plt
 import numpy as np
+import matplotlib.pyplot as plt
+
+# ------------------------------------------------------------
+# Constants
+# ------------------------------------------------------------
 
 TIMESTEP_ms = 1
 TIMESTEP_s = TIMESTEP_ms / 1000
 
 GRAVITY_MPS2 = -9.81
 
-# Standard air density at sea level
-AIR_DENSITY_KGPM3 = 1.225
+
+# ------------------------------------------------------------
+# Quaternion math
+# Quaternion format: q = [w, x, y, z]
+# ------------------------------------------------------------
+
+def quat_normalize(q):
+    return q / np.linalg.norm(q)
 
 
-class PhysThing:
-    def __init__(self, mass_kg, area_m2, drag_coeff,
-                 x_m=0, y_m=0, z_m=0,
-                 v_x_mps=0, v_y_mps=0, v_z_mps=0):
-        self.mass_kg = mass_kg
-        self.area_m2 = area_m2
-        self.drag_coeff = drag_coeff
+def quat_multiply(q1, q2):
+    """
+    Hamilton product q1 ⊗ q2.
+    """
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
 
-        # position in world frame
-        self.x_m = x_m
-        self.y_m = y_m
-        self.z_m = z_m
-
-        # velocity in world frame
-        self.v_x_mps = v_x_mps
-        self.v_y_mps = v_y_mps
-        self.v_z_mps = v_z_mps
-
-    def pos(self):
-        return np.array([self.x_m, self.y_m, self.z_m])
-
-    def vel(self):
-        return np.array([self.v_x_mps, self.v_y_mps, self.v_z_mps])
-
-    def set_pos(self, pos):
-        self.x_m = pos[0]
-        self.y_m = pos[1]
-        self.z_m = pos[2]
-
-    def set_vel(self, vel):
-        self.v_x_mps = vel[0]
-        self.v_y_mps = vel[1]
-        self.v_z_mps = vel[2]
+    return np.array([
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2
+    ], dtype=float)
 
 
-def get_gravity_force(thing):
+def quat_to_rotation_matrix(q):
+    """
+    Converts body-to-world quaternion into rotation matrix R.
+
+    v_world = R @ v_body
+    """
+    q = quat_normalize(q)
+    w, x, y, z = q
+
+    return np.array([
+        [1 - 2*(y*y + z*z),     2*(x*y - w*z),         2*(x*z + w*y)],
+        [2*(x*y + w*z),         1 - 2*(x*x + z*z),     2*(y*z - w*x)],
+        [2*(x*z - w*y),         2*(y*z + w*x),         1 - 2*(x*x + y*y)]
+    ], dtype=float)
+
+
+def rotation_matrix_to_euler_deg(R):
+    """
+    Returns roll, pitch, yaw in degrees.
+
+    This is only for plotting/debugging.
+    The actual simulation uses quaternions.
+    """
+    pitch = np.arcsin(-R[2, 0])
+    roll = np.arctan2(R[2, 1], R[2, 2])
+    yaw = np.arctan2(R[1, 0], R[0, 0])
+
+    return np.degrees(roll), np.degrees(pitch), np.degrees(yaw)
+
+
+# ------------------------------------------------------------
+# Mass point
+# ------------------------------------------------------------
+
+class MassPoint:
+    def __init__(self, mass_kg, local_pos_m):
+        self.mass_kg = float(mass_kg)
+
+        # Position in body frame before COM correction
+        self.local_pos_m = np.array(local_pos_m, dtype=float)
+
+
+# ------------------------------------------------------------
+# Rigid body made from multiple point masses
+# ------------------------------------------------------------
+
+class RigidBody:
+    def __init__(
+        self,
+        points,
+        pos_world_m=(0, 0, 0),
+        vel_world_mps=(0, 0, 0),
+        q_body_to_world=(1, 0, 0, 0),
+        omega_body_radps=(0, 0, 0)
+    ):
+        self.points = points
+
+        self.pos_world_m = np.array(pos_world_m, dtype=float)
+        self.vel_world_mps = np.array(vel_world_mps, dtype=float)
+
+        self.q_body_to_world = quat_normalize(
+            np.array(q_body_to_world, dtype=float)
+        )
+
+        # Angular velocity expressed in body frame
+        self.omega_body_radps = np.array(omega_body_radps, dtype=float)
+
+        self.mass_kg = sum(p.mass_kg for p in self.points)
+
+        self.shift_origin_to_center_of_mass()
+
+        self.I_body = self.compute_body_inertia_tensor()
+        self.I_body_inv = np.linalg.inv(self.I_body)
+
+    def shift_origin_to_center_of_mass(self):
+        """
+        Shift all local point positions so the rigid body's body-frame origin
+        is exactly at the center of mass.
+        """
+        com = sum(
+            p.mass_kg * p.local_pos_m for p in self.points
+        ) / self.mass_kg
+
+        for p in self.points:
+            p.local_pos_m = p.local_pos_m - com
+
+    def compute_body_inertia_tensor(self):
+        """
+        Moment of inertia tensor for point masses:
+
+            I = Σ m (|r|² I₃ - r rᵀ)
+
+        where r is the point position relative to the COM.
+        """
+        I = np.zeros((3, 3), dtype=float)
+
+        for p in self.points:
+            r = p.local_pos_m
+            r_squared = np.dot(r, r)
+
+            I += p.mass_kg * (
+                r_squared * np.eye(3) - np.outer(r, r)
+            )
+
+        return I
+
+    def rotation_matrix(self):
+        return quat_to_rotation_matrix(self.q_body_to_world)
+
+    def point_world_offset(self, point):
+        """
+        World-frame offset from COM to this point.
+        """
+        R = self.rotation_matrix()
+        return R @ point.local_pos_m
+
+    def point_world_position(self, point):
+        return self.pos_world_m + self.point_world_offset(point)
+
+    def point_world_velocity(self, point):
+        """
+        Velocity of a point on a rigid body:
+
+            v_point = v_COM + ω × r
+
+        omega is converted from body frame to world frame first.
+        """
+        R = self.rotation_matrix()
+
+        omega_world = R @ self.omega_body_radps
+        r_world = self.point_world_offset(point)
+
+        return self.vel_world_mps + np.cross(omega_world, r_world)
+
+
+# ------------------------------------------------------------
+# Real physics force model: gravity only
+# ------------------------------------------------------------
+
+def gravity_force_on_point(point):
+    """
+    Uniform gravity:
+
+        F_g = m g
+
+    Since gravity is uniform, it acts through the center of mass overall.
+    Therefore it does not create net torque about the COM.
+    """
     return np.array([
         0,
         0,
-        thing.mass_kg * GRAVITY_MPS2
-    ])
+        point.mass_kg * GRAVITY_MPS2
+    ], dtype=float)
 
 
-def get_air_resistance_force(thing):
-    """
-    Quadratic air resistance:
+# ------------------------------------------------------------
+# Rigid body time step
+# ------------------------------------------------------------
 
-        F_drag = 0.5 * rho * Cd * A * v^2
+def step_rigidbody(body, dt_s):
+    R = body.rotation_matrix()
 
-    Direction is opposite to velocity.
-    """
+    total_force_world = np.zeros(3)
+    total_torque_world = np.zeros(3)
 
-    velocity = thing.vel()
-    speed = np.linalg.norm(velocity)
+    for p in body.points:
+        r_world = body.point_world_offset(p)
+        F_world = gravity_force_on_point(p)
 
-    if speed == 0:
-        return np.array([0, 0, 0])
+        total_force_world += F_world
 
-    drag_magnitude = (
-        0.5
-        * AIR_DENSITY_KGPM3
-        * thing.drag_coeff
-        * thing.area_m2
-        * speed**2
+        # Torque about COM:
+        #
+        #     τ = r × F
+        #
+        total_torque_world += np.cross(r_world, F_world)
+
+    # --------------------------------------------------------
+    # Linear dynamics
+    #
+    #     F = ma
+    # --------------------------------------------------------
+
+    accel_world_mps2 = total_force_world / body.mass_kg
+
+    body.vel_world_mps += accel_world_mps2 * dt_s
+    body.pos_world_m += body.vel_world_mps * dt_s
+
+    # --------------------------------------------------------
+    # Rotational dynamics
+    #
+    # Euler's rigid-body equation in body frame:
+    #
+    #     τ = Iω_dot + ω × Iω
+    #
+    # so:
+    #
+    #     ω_dot = I⁻¹ [τ - ω × Iω]
+    # --------------------------------------------------------
+
+    torque_body = R.T @ total_torque_world
+
+    omega = body.omega_body_radps
+    I = body.I_body
+
+    omega_dot = body.I_body_inv @ (
+        torque_body - np.cross(omega, I @ omega)
     )
 
-    velocity_direction = velocity / speed
+    body.omega_body_radps += omega_dot * dt_s
 
-    drag_force = -drag_magnitude * velocity_direction
+    # --------------------------------------------------------
+    # Quaternion orientation update
+    #
+    # For body-frame angular velocity:
+    #
+    #     q_dot = 1/2 q ⊗ [0, ωx, ωy, ωz]
+    # --------------------------------------------------------
 
-    return drag_force
+    omega_quat = np.array([
+        0,
+        body.omega_body_radps[0],
+        body.omega_body_radps[1],
+        body.omega_body_radps[2]
+    ], dtype=float)
+
+    q_dot = 0.5 * quat_multiply(
+        body.q_body_to_world,
+        omega_quat
+    )
+
+    body.q_body_to_world += q_dot * dt_s
+    body.q_body_to_world = quat_normalize(body.q_body_to_world)
 
 
-def apply_dynamics(thing, dt_s):
-    gravity_force = get_gravity_force(thing)
-    drag_force = get_air_resistance_force(thing)
+# ------------------------------------------------------------
+# Simulation
+# ------------------------------------------------------------
 
-    total_force = gravity_force + drag_force
-
-    acceleration = total_force / thing.mass_kg
-
-    new_vel = thing.vel() + acceleration * dt_s
-    new_pos = thing.pos() + new_vel * dt_s
-
-    thing.set_vel(new_vel)
-    thing.set_pos(new_pos)
-
-
-def simulate_drop(thing, simulation_time_s):
+def simulate(body, simulation_time_s):
     time_list = []
     z_list = []
-    v_z_list = []
+
+    roll_list = []
+    pitch_list = []
+    yaw_list = []
+
+    x_nose_list = []
+    z_nose_list = []
 
     num_steps = int(simulation_time_s / TIMESTEP_s)
 
+    # Choose the nose point for visualization
+    nose_point = max(body.points, key=lambda p: p.local_pos_m[0])
+
     for i in range(num_steps):
-        time_s = i * TIMESTEP_s
+        t = i * TIMESTEP_s
 
-        time_list.append(time_s)
-        z_list.append(thing.z_m)
-        v_z_list.append(thing.v_z_mps)
+        R = body.rotation_matrix()
+        roll, pitch, yaw = rotation_matrix_to_euler_deg(R)
 
-        apply_dynamics(thing, TIMESTEP_s)
+        nose_world = body.point_world_position(nose_point)
 
-        if thing.z_m <= 0:
-            thing.z_m = 0
-            time_list.append(time_s + TIMESTEP_s)
-            z_list.append(0)
-            v_z_list.append(thing.v_z_mps)
+        time_list.append(t)
+        z_list.append(body.pos_world_m[2])
+
+        roll_list.append(roll)
+        pitch_list.append(pitch)
+        yaw_list.append(yaw)
+
+        x_nose_list.append(nose_world[0])
+        z_nose_list.append(nose_world[2])
+
+        step_rigidbody(body, TIMESTEP_s)
+
+        if body.pos_world_m[2] <= 0:
+            body.pos_world_m[2] = 0
             break
 
-    return time_list, z_list, v_z_list
+    return {
+        "time_s": np.array(time_list),
+        "z_m": np.array(z_list),
+        "roll_deg": np.array(roll_list),
+        "pitch_deg": np.array(pitch_list),
+        "yaw_deg": np.array(yaw_list),
+        "nose_x_m": np.array(x_nose_list),
+        "nose_z_m": np.array(z_nose_list),
+    }
 
 
+# ------------------------------------------------------------
+# Example rigid plane-shaped mass structure
+# ------------------------------------------------------------
 
-# aero helper function 
-def reynolds_number(chord_m, vel_mps, nu=1.48e-5):
+def make_plane_mass_structure():
     """
-    Calculate Reynolds number for an airfoil.
+    This is only a rigid mass distribution.
 
-    Parameters:
-        chord_m : float
-            Chord length in meters.
-        vel_mps : float
-            Freestream velocity in m/s.
-        nu : float
-            Kinematic viscosity of air in m^2/s.
-            Default is about sea-level air at ~15°C.
+    It is shaped like a simple airplane, but it has no aerodynamic lift,
+    no thrust, no control surfaces, and no fake behavior.
 
-    Returns:
-        float
-            Reynolds number.
+    Body frame convention:
+
+        x = forward
+        y = right
+        z = up
     """
-    return vel_mps * chord_m / nu
+
+    points = [
+        # fuselage / center
+        MassPoint(0.80, (0.00,  0.00, 0.00)),
+
+        # nose
+        MassPoint(0.20, (0.80,  0.00, 0.00)),
+
+        # tail
+        MassPoint(0.15, (-0.90, 0.00, 0.05)),
+
+        # left and right wings
+        MassPoint(0.12, (0.00, -0.70, 0.00)),
+        MassPoint(0.12, (0.00,  0.70, 0.00)),
+
+        # vertical tail mass, slightly above rear body
+        MassPoint(0.06, (-0.80, 0.00, 0.25)),
+    ]
+
+    body = RigidBody(
+        points=points,
+
+        # Initial COM position
+        pos_world_m=(0, 0, 20),
+
+        # Initial COM velocity
+        vel_world_mps=(5, 0, 0),
+
+        # Initial orientation
+        q_body_to_world=(1, 0, 0, 0),
+
+        # Initial body angular velocity.
+        # This makes the rigid body tumble while falling.
+        # changed to not do that
+        omega_body_radps=(0,0,0)
+    )
+
+    return body
 
 
-# # Example:
-# chord_m = 0.20
-# vel_mps = 15
+# ------------------------------------------------------------
+# Run
+# ------------------------------------------------------------
 
-# Re = reynolds_number(chord_m, vel_mps)
-# print(f"Re = {Re:.2e}")
+body = make_plane_mass_structure()
 
+print("Total mass:", body.mass_kg, "kg")
+print("Body-frame inertia tensor:")
+print(body.I_body)
 
-
-
-# -----------------------------
-# Stone vs feather
-# -----------------------------
-
-drop_height_m = 20
-simulation_time_s = 10
-
-stone = PhysThing(
-    mass_kg=0.1,        # 100 g stone
-    area_m2=0.0005,     # small frontal area
-    drag_coeff=0.47,    # sphere-like object
-    z_m=drop_height_m
-)
-
-feather = PhysThing(
-    mass_kg=0.001,      # 1 g feather
-    area_m2=0.01,       # large area
-    drag_coeff=1.3,     # irregular flat object
-    z_m=drop_height_m
-)
-
-stone_t, stone_z, stone_vz = simulate_drop(stone, simulation_time_s)
-feather_t, feather_z, feather_vz = simulate_drop(feather, simulation_time_s)
+result = simulate(body, simulation_time_s=5)
 
 
-# -----------------------------
-# Plot height vs time
-# -----------------------------
+# ------------------------------------------------------------
+# Plot center of mass height
+# ------------------------------------------------------------
 
-plt.plot(stone_t, stone_z, label="Stone")
-plt.plot(feather_t, feather_z, label="Feather")
+plt.plot(result["time_s"], result["z_m"])
 
 plt.xlabel("Time (s)")
-plt.ylabel("Height z (m)")
-plt.title("Stone vs Feather Drop with Air Resistance")
+plt.ylabel("Center of mass height z (m)")
+plt.title("Rigid Body Falling Under Gravity")
+plt.grid(True)
+plt.show()
+
+
+# ------------------------------------------------------------
+# Plot attitude
+# ------------------------------------------------------------
+
+plt.plot(result["time_s"], result["roll_deg"], label="Roll")
+plt.plot(result["time_s"], result["pitch_deg"], label="Pitch")
+plt.plot(result["time_s"], result["yaw_deg"], label="Yaw")
+
+plt.xlabel("Time (s)")
+plt.ylabel("Angle (deg)")
+plt.title("Rigid Body Attitude While Falling")
 plt.legend()
 plt.grid(True)
 plt.show()
 
 
-# -----------------------------
-# Plot vertical velocity vs time
-# -----------------------------
+# ------------------------------------------------------------
+# Plot nose path
+# ------------------------------------------------------------
 
-plt.plot(stone_t, stone_vz, label="Stone")
-plt.plot(feather_t, feather_vz, label="Feather")
+plt.plot(result["nose_x_m"], result["nose_z_m"])
 
-plt.xlabel("Time (s)")
-plt.ylabel("Vertical velocity vz (m/s)")
-plt.title("Vertical Velocity with Air Resistance")
-plt.legend()
+plt.xlabel("Nose x position (m)")
+plt.ylabel("Nose z position (m)")
+plt.title("Nose Point Path During Rigid-Body Falling Motion")
 plt.grid(True)
 plt.show()
 
 
-print("Stone final time:", stone_t[-1], "s")
-print("Feather final time:", feather_t[-1], "s")
-
-print("Stone final velocity:", stone_vz[-1], "m/s")
-print("Feather final velocity:", feather_vz[-1], "m/s")
+print("Final COM position:", body.pos_world_m)
+print("Final COM velocity:", body.vel_world_mps)
+print("Final angular velocity in body frame:", body.omega_body_radps)
+print("Final quaternion body-to-world:", body.q_body_to_world)
