@@ -113,7 +113,7 @@ class Aircraft:
         # Engine
         self.max_thrust = 40.0
 
-        # For debug display
+        # Debug values
         self.yaw_rate = 0.0
         self.roll_rate = 0.0
         self.pitch_rate = 0.0
@@ -126,9 +126,12 @@ class Aircraft:
         """
         Body-to-world rotation.
 
-        R = yaw around world y,
-            then pitch around body z,
-            then bank/roll around body x.
+        Body frame:
+            x = nose
+            y = aircraft top
+            z = right wing
+
+        This builds the display/physics orientation.
         """
         return rot_y(self.yaw) @ rot_z(self.pitch) @ rot_x(self.bank)
 
@@ -154,7 +157,7 @@ class Aircraft:
         # 1. Assisted attitude response
         # =========================
 
-        # Roll response: bank slowly follows target_bank
+        # Roll / bank response
         bank_error = self.target_bank - self.bank
 
         max_roll_rate = math.radians(35.0)
@@ -164,7 +167,7 @@ class Aircraft:
         self.roll_rate = desired_roll_rate
         self.bank += self.roll_rate * dt
 
-        # Pitch response: pitch slowly follows target_pitch
+        # Pitch response
         pitch_error = self.target_pitch - self.pitch
 
         max_pitch_rate = math.radians(25.0)
@@ -181,15 +184,18 @@ class Aircraft:
         # =========================
         # 2. Coordinated turn
         # =========================
-        # This is what makes left/right visibly turn the aircraft.
+        # Important direction fix:
+        # In this coordinate/rendering convention, the sign needs to be negative.
         #
-        # yaw_rate = g * tan(bank) / speed
-        #
-        # Positive bank produces a heading turn.
-        # Rudder adds extra yaw control.
+        # Result:
+        #   bank < 0, left bank  -> left turn
+        #   bank > 0, right bank -> right turn
         # =========================
 
-        coordinated_yaw_rate = G * math.tan(self.bank) / speed
+        coordinated_yaw_rate = -G * math.tan(self.bank) / speed
+
+        # Rudder yaw.
+        # A/D input has already been sign-corrected in the main loop.
         rudder_yaw_rate = 0.7 * self.rudder
 
         self.yaw_rate = coordinated_yaw_rate + rudder_yaw_rate
@@ -514,16 +520,18 @@ def main():
     aircraft = Aircraft()
 
     print("Controls:")
-    print("  Left / Right arrow : bank left / right and turn")
+    print("  Left arrow         : bank left and turn left")
+    print("  Right arrow        : bank right and turn right")
     print("  Up / Down arrow    : pitch target up / down")
-    print("  A / D              : rudder yaw")
+    print("  A                  : yaw left")
+    print("  D                  : yaw right")
     print("  W / S              : throttle up / down")
     print("  PageUp / PageDown  : throttle alternative")
     print("  R                  : reset")
     print("  ESC                : quit")
     print()
     print("This version uses a coordinated-turn model:")
-    print("  yaw_rate = g * tan(bank) / speed")
+    print("  yaw_rate = -g * tan(bank) / speed")
     print()
     print("Click the OpenGL window first, then press keys.")
     print()
@@ -595,14 +603,19 @@ def main():
         # =========================
         # Rudder A / D
         # =========================
+        # Direction fix:
+        # A should yaw left, D should yaw right.
+        # In this coordinate convention, A increases rudder,
+        # D decreases rudder.
+        # =========================
 
         rudder_rate = math.radians(90.0) * dt
         rudder_return_rate = math.radians(70.0) * dt
 
         if keys[K_a]:
-            aircraft.rudder -= rudder_rate
-        elif keys[K_d]:
             aircraft.rudder += rudder_rate
+        elif keys[K_d]:
+            aircraft.rudder -= rudder_rate
         else:
             if aircraft.rudder > 0:
                 aircraft.rudder = max(0.0, aircraft.rudder - rudder_return_rate)
@@ -653,7 +666,8 @@ def main():
                 f"yaw={math.degrees(aircraft.yaw):7.2f} deg | "
                 f"yaw_rate={math.degrees(aircraft.yaw_rate):7.2f} deg/s | "
                 f"pitch={math.degrees(aircraft.pitch):6.2f} deg | "
-                f"alpha={math.degrees(aircraft.alpha):6.2f} deg"
+                f"alpha={math.degrees(aircraft.alpha):6.2f} deg | "
+                f"rud={math.degrees(aircraft.rudder):6.2f} deg"
             )
 
         # =========================
