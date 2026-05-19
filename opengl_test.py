@@ -222,6 +222,7 @@ class Aircraft:
 
         CL = self.CL0 + self.CL_alpha * self.alpha
         CL = clamp(CL, -self.CL_max, self.CL_max)
+        # lookup table CL V alpha
 
         CD = self.CD0 + self.k_induced * CL * CL
 
