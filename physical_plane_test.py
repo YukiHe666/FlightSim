@@ -37,18 +37,23 @@ RAD2DEG = 180.0 / math.pi
 
 DRAW_FORCE_ARROWS = True
 
-# Arrow length scale: meters per Newton in OpenGL world frame.
 FORCE_ARROW_SCALE = 0.15
-
-# Limit arrow length to avoid huge arrows.
 MAX_FORCE_ARROW_LEN = 0.80
+
+
+# ============================================================
+# HUD display
+# ============================================================
+
+DRAW_FORCE_HUD = True
+HUD_FONT_SIZE = 18
+HUD_LINE_SPACING = 24
 
 
 # ============================================================
 # V-tail geometry
 # ============================================================
 
-# Initial tail angle. Press 3 for 30 deg, press 4 for 45 deg.
 TAIL_ANGLE_DEG = 30.0
 
 TAIL_SPAN_M = 0.32
@@ -107,6 +112,7 @@ def print_vtail_angle_comparison():
     print("45 deg: balanced pitch and yaw contribution. More standard V-tail-like.")
     print()
     print("OpenGL controls:")
+    print("Press P: pause / resume")
     print("Press 3: switch V-tail to 30 degrees")
     print("Press 4: switch V-tail to 45 degrees")
     print("Press F: show/hide force arrows")
@@ -344,21 +350,9 @@ class Aircraft:
         self.tail_angle_deg = TAIL_ANGLE_DEG
         self.tail_angle_rad = self.tail_angle_deg * DEG2RAD
 
-        # Body frame:
-        # +x = nose direction
-        # +y = aircraft right
-        # +z = aircraft upward
-        #
-        # World frame:
-        # +x = initial forward direction
-        # +y = horizontal side direction
-        # +z = vertical upward
-        #
-        # All forces in force_debug are stored in WORLD frame.
-
         self.parts.append(AircraftPart(
             name="fuselage",
-            mass_kg=1.0,
+            mass_kg=2.0,
             r_body=[0.25, 0.0, 0.0],
             area_m2=0.035,
             chord_m=0.50,
@@ -465,7 +459,6 @@ class Aircraft:
         self.vel = np.array([18.0, 0.0, 0.0], dtype=float)
 
         # Still air by default.
-        # Drag is opposite to velocity relative to this wind field.
         self.wind_world = np.array([0.0, 0.0, 0.0], dtype=float)
 
         self.q = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
@@ -502,15 +495,9 @@ class Aircraft:
 
     def add_force_debug(self, name, part_name, start_world, force_world, color):
         """
-        Store the exact force used by the physics solver.
+        Store exact force used by physics solver.
 
-        start_world:
-            Application point in WORLD frame.
-
-        force_world:
-            Force vector in WORLD frame.
-
-        OpenGL arrows are drawn directly from these world-frame values.
+        start_world and force_world are both WORLD coordinates.
         """
 
         if np.linalg.norm(force_world) < 1e-8:
@@ -600,24 +587,18 @@ class Aircraft:
         left_cmd = 0.0
         right_cmd = 0.0
 
-        # W: both main wings down
         if keys[K_w]:
             left_cmd += flap_rate
             right_cmd += flap_rate
 
-        # S: both main wings up
         if keys[K_s]:
             left_cmd -= flap_rate
             right_cmd -= flap_rate
 
-        # A: turn left
-        # left wing down, right wing up
         if keys[K_a]:
             left_cmd += flap_rate
             right_cmd -= flap_rate
 
-        # D: turn right
-        # left wing up, right wing down
         if keys[K_d]:
             left_cmd -= flap_rate
             right_cmd += flap_rate
@@ -628,11 +609,9 @@ class Aircraft:
         self.left_wing.deflection = clamp(self.left_wing.deflection, -max_flap, max_flap)
         self.right_wing.deflection = clamp(self.right_wing.deflection, -max_flap, max_flap)
 
-        # Tail surfaces are passive here.
         self.left_tail.deflection *= 0.98
         self.right_tail.deflection *= 0.98
 
-        # Throttle
         if keys[K_UP]:
             self.throttle += 0.5 * dt
         if keys[K_DOWN]:
@@ -640,7 +619,6 @@ class Aircraft:
 
         self.throttle = clamp(self.throttle, 0.0, 1.0)
 
-        # Return to neutral when no key is pressed.
         if not (keys[K_w] or keys[K_s] or keys[K_a] or keys[K_d]):
             self.left_wing.deflection *= 0.95
             self.right_wing.deflection *= 0.95
@@ -649,13 +627,12 @@ class Aircraft:
         """
         Compute actual forces acting on one aircraft part.
 
-        Important:
-        All forces here are stored and visualized in WORLD COORDINATES.
+        All force arrows are stored and displayed in WORLD coordinates.
 
         Forces:
             gravity: world -Z
-            drag: opposite to local relative air velocity
-            lift: perpendicular to local relative velocity and span direction
+            drag: opposite local relative air velocity
+            lift: perpendicular to local relative velocity and span
         """
 
         r_body_from_origin = part.r_body
@@ -668,12 +645,10 @@ class Aircraft:
 
         omega_world = R @ self.omega_body
 
-        # Local velocity of this part:
-        # aircraft translation + rotational velocity around CG.
+        # Local part velocity = translation + rotation around CG.
         v_part_world = self.vel + np.cross(omega_world, r_world_from_cg)
 
-        # Relative velocity between the part and the air.
-        # If wind_world = 0, this is just velocity through still air.
+        # Velocity relative to surrounding air.
         v_rel_world = v_part_world - self.wind_world
         speed = np.linalg.norm(v_rel_world)
 
@@ -683,36 +658,31 @@ class Aircraft:
             v_rel_hat_world = np.zeros(3)
 
         # =====================================================
-        # 1. Gravity
+        # Gravity
         # =====================================================
 
-        # Gravity is always vertical downward in WORLD frame.
-        # This should ALWAYS be [0, 0, negative].
         F_gravity_world = np.array([0.0, 0.0, -part.mass * G])
 
         self.add_force_debug(
             name="gravity",
             part_name=part.name,
-            start_world=part_pos_world + np.array([0.00, 0.00, 0.00]),
+            start_world=part_pos_world,
             force_world=F_gravity_world,
             color=(1.0, 0.1, 0.1)
         )
 
         # =====================================================
-        # 2. Drag
+        # Drag
         # =====================================================
 
         F_drag_world = np.zeros(3)
 
         if speed > 0.1:
             q_dyn = 0.5 * RHO * speed * speed
-
-            # Basic drag for non-lifting parts.
-            # Direction is always opposite local relative velocity.
             F_drag_world = -q_dyn * part.cd0 * part.area * v_rel_hat_world
 
         # =====================================================
-        # 3. Lift
+        # Lift
         # =====================================================
 
         F_lift_world = np.zeros(3)
@@ -723,10 +693,8 @@ class Aircraft:
             vx = v_rel_body[0]
             vz = v_rel_body[2]
 
-            # Angle of attack.
             alpha = math.atan2(-vz, max(abs(vx), 1e-3))
 
-            # Control surface deflection changes effective angle of attack.
             alpha_eff = alpha + part.deflection
             alpha_eff_deg = alpha_eff * RAD2DEG
 
@@ -737,26 +705,19 @@ class Aircraft:
             AR = max(part.aspect_ratio, 0.1)
             e = 0.75
 
-            # Finite-wing correction.
             CL = CL_2D / (1.0 + abs(CL_2D) / (math.pi * e * AR))
-
-            # Induced drag.
             CD_induced = CL * CL / (math.pi * e * AR)
             CD = CD_2D + CD_induced
 
             q_dyn = 0.5 * RHO * speed * speed
 
-            # For lifting surfaces, replace simple drag with polar-based drag.
             F_drag_world = -q_dyn * CD * part.area * v_rel_hat_world
 
-            # Lift direction in WORLD frame.
-            # Lift is perpendicular to velocity and span.
             span_world = R @ part.span_axis_body
 
             lift_dir_world = np.cross(v_rel_hat_world, span_world)
             lift_dir_world = norm(lift_dir_world)
 
-            # Choose the lift direction closer to aircraft body-up.
             body_up_world = R @ np.array([0.0, 0.0, 1.0])
 
             if np.dot(lift_dir_world, body_up_world) < 0:
@@ -764,34 +725,25 @@ class Aircraft:
 
             F_lift_world = q_dyn * CL * part.area * lift_dir_world
 
-        # Record drag after possible polar-based replacement.
         self.add_force_debug(
             name="drag",
             part_name=part.name,
-            start_world=part_pos_world + np.array([-0.04, 0.00, 0.00]),
+            start_world=part_pos_world + np.array([-0.04, 0.0, 0.0]),
             force_world=F_drag_world,
             color=(1.0, 0.0, 1.0)
         )
 
-        # Record lift.
         self.add_force_debug(
             name="lift",
             part_name=part.name,
-            start_world=part_pos_world + np.array([0.04, 0.00, 0.00]),
+            start_world=part_pos_world + np.array([0.04, 0.0, 0.0]),
             force_world=F_lift_world,
             color=(0.1, 1.0, 0.1)
         )
 
-        # =====================================================
-        # 4. Total force and torque
-        # =====================================================
-
         F_total_world = F_gravity_world + F_drag_world + F_lift_world
 
-        # Torque about center of gravity.
-        #
-        # Convert total force to body frame only for rotational dynamics.
-        # This does NOT affect the displayed arrows.
+        # Convert to body frame only for rotational dynamics.
         F_total_body = R.T @ F_total_world
         tau_body = np.cross(r_body_from_cg, F_total_body)
 
@@ -803,13 +755,10 @@ class Aircraft:
         F_total_world = np.zeros(3)
         tau_total_body = np.zeros(3)
 
-        # Clear debug force list every physics step.
         self.force_debug = []
 
-        # Forces on each aircraft part.
         for part in self.parts:
             F_world, tau_body = self.compute_part_forces(part, R)
-
             F_total_world += F_world
             tau_total_body += tau_body
 
@@ -817,14 +766,12 @@ class Aircraft:
         # Thrust
         # =====================================================
 
-        # Thrust is defined in body frame along aircraft nose direction.
         thrust_body = np.array([
             self.max_thrust * self.throttle,
             0.0,
             0.0
         ])
 
-        # Convert thrust to WORLD frame for force accumulation and drawing.
         thrust_world = R @ thrust_body
 
         thrust_pos_body = np.array([0.35, 0.0, 0.0])
@@ -860,7 +807,6 @@ class Aircraft:
         self.vel += acc_world * dt
         self.pos += self.vel * dt
 
-        # Simple ground collision.
         if self.pos[2] < 0.3:
             self.pos[2] = 0.3
 
@@ -894,14 +840,6 @@ class Aircraft:
 # ============================================================
 
 def draw_arrow_world(start_world, force_world, scale, color):
-    """
-    Draw a force arrow directly in WORLD coordinates.
-
-    No aircraft body transform is active when this function is called.
-    Therefore:
-        gravity [0, 0, -mg] will always point world-down.
-    """
-
     force_mag = np.linalg.norm(force_world)
 
     if force_mag < 1e-6:
@@ -916,7 +854,6 @@ def draw_arrow_world(start_world, force_world, scale, color):
 
     glColor3f(color[0], color[1], color[2])
 
-    # Main line.
     glLineWidth(3.0)
     glBegin(GL_LINES)
     glVertex3f(start_world[0], start_world[1], start_world[2])
@@ -924,7 +861,6 @@ def draw_arrow_world(start_world, force_world, scale, color):
     glEnd()
     glLineWidth(1.0)
 
-    # Arrow head.
     head_len = 0.08
     head_width = 0.04
 
@@ -952,35 +888,15 @@ def draw_arrow_world(start_world, force_world, scale, color):
 
 
 def draw_force_arrows(aircraft):
-    """
-    Draw exact forces used in physics simulation.
-
-    Each arrow comes directly from aircraft.force_debug.
-
-    Everything is WORLD frame:
-        start_world
-        force_world
-
-    Colors:
-        gravity = red
-        lift    = green
-        drag    = magenta
-        thrust  = orange
-    """
-
     if not DRAW_FORCE_ARROWS:
         return
 
     for info in aircraft.force_debug:
-        start_world = info["start_world"]
-        force_world = info["force_world"]
-        color = info["color"]
-
         draw_arrow_world(
-            start_world,
-            force_world,
+            info["start_world"],
+            info["force_world"],
             FORCE_ARROW_SCALE,
-            color=color
+            info["color"]
         )
 
 
@@ -1025,18 +941,12 @@ def draw_aircraft(aircraft):
     M[:3, :3] = R
     M[:3, 3] = aircraft.pos
 
-    # ========================================================
-    # Draw aircraft body in aircraft/body coordinates
-    # ========================================================
-
     glPushMatrix()
     glMultMatrixf(M.T)
 
-    # Origin marker.
     glColor3f(1.0, 1.0, 0.0)
     draw_box([0.05, 0.05, 0.05])
 
-    # CG marker.
     glPushMatrix()
     glTranslatef(
         aircraft.cg_body[0],
@@ -1047,7 +957,6 @@ def draw_aircraft(aircraft):
     draw_box([0.045, 0.045, 0.045])
     glPopMatrix()
 
-    # Tail joint / V-tail root connector.
     glPushMatrix()
     glTranslatef(TAIL_ROOT_X, 0.0, TAIL_ROOT_Z)
     glColor3f(0.8, 0.8, 0.8)
@@ -1100,12 +1009,7 @@ def draw_aircraft(aircraft):
 
     glPopMatrix()
 
-    # ========================================================
-    # Draw force arrows in WORLD coordinates
-    # ========================================================
-    #
-    # This is deliberately outside the aircraft body transform.
-    # Therefore gravity will not rotate with the aircraft.
+    # Force arrows are drawn after leaving aircraft transform.
     draw_force_arrows(aircraft)
 
 
@@ -1138,26 +1042,16 @@ def setup_opengl(width, height):
 
 def set_camera(aircraft):
     """
-    Camera follows the aircraft position and forward direction,
-    but it does NOT roll with the aircraft.
-
-    Important:
-    world_up = [0, 0, 1]
-
-    This prevents world-down gravity from visually looking like
-    aircraft-backward gravity.
+    Camera follows aircraft but uses world-up, not aircraft-up.
     """
 
     glMatrixMode(GL_MODELVIEW)
     glLoadIdentity()
 
     R = quat_to_rotmat(aircraft.q)
-
     forward = R @ np.array([1.0, 0.0, 0.0])
 
     target = aircraft.pos
-
-    # Follow behind aircraft, but keep camera world-up.
     cam_pos = aircraft.pos - forward * 5.0 + np.array([0.0, 0.0, 2.0])
 
     world_up = np.array([0.0, 0.0, 1.0])
@@ -1170,18 +1064,257 @@ def set_camera(aircraft):
 
 
 # ============================================================
+# HUD drawing
+# ============================================================
+
+def force_totals_from_debug(aircraft):
+    """
+    Sum current forces from aircraft.force_debug.
+    All forces are already stored in WORLD coordinates.
+    """
+
+    totals = {
+        "gravity": np.zeros(3),
+        "drag": np.zeros(3),
+        "lift": np.zeros(3),
+        "thrust": np.zeros(3),
+    }
+
+    for info in aircraft.force_debug:
+        name = info["name"]
+        if name in totals:
+            totals[name] += info["force_world"]
+
+    totals["total"] = (
+        totals["gravity"]
+        + totals["drag"]
+        + totals["lift"]
+        + totals["thrust"]
+    )
+
+    return totals
+
+
+def format_force_line(name, F):
+    mag = np.linalg.norm(F)
+
+    return (
+        f"{name:<8s} "
+        f"Fx={F[0]:8.2f}  "
+        f"Fy={F[1]:8.2f}  "
+        f"Fz={F[2]:8.2f}  "
+        f"|F|={mag:8.2f} N"
+    )
+
+
+def begin_2d_overlay():
+    """
+    Switch OpenGL into 2D screen-coordinate mode.
+
+    Coordinates:
+        x = pixels from left
+        y = pixels from top
+    """
+
+    viewport = glGetIntegerv(GL_VIEWPORT)
+    width = viewport[2]
+    height = viewport[3]
+
+    glMatrixMode(GL_PROJECTION)
+    glPushMatrix()
+    glLoadIdentity()
+    glOrtho(0, width, height, 0, -1, 1)
+
+    glMatrixMode(GL_MODELVIEW)
+    glPushMatrix()
+    glLoadIdentity()
+
+    glDisable(GL_DEPTH_TEST)
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+    return width, height
+
+
+def end_2d_overlay():
+    glDisable(GL_BLEND)
+    glEnable(GL_DEPTH_TEST)
+
+    glMatrixMode(GL_MODELVIEW)
+    glPopMatrix()
+
+    glMatrixMode(GL_PROJECTION)
+    glPopMatrix()
+
+    glMatrixMode(GL_MODELVIEW)
+
+
+def draw_filled_rect_2d(x, y, w, h, color):
+    """
+    Draw a solid 2D rectangle.
+
+    color = (r, g, b, a), each from 0.0 to 1.0
+    """
+
+    glColor4f(color[0], color[1], color[2], color[3])
+
+    glBegin(GL_QUADS)
+    glVertex2f(x, y)
+    glVertex2f(x + w, y)
+    glVertex2f(x + w, y + h)
+    glVertex2f(x, y + h)
+    glEnd()
+
+
+def draw_text_2d(x, y, text, font, color=(255, 255, 255)):
+    """
+    Draw text using an OpenGL texture.
+
+    This avoids the white-rectangle problem caused by glDrawPixels.
+    """
+
+    text_surface = font.render(text, True, color)
+    text_surface = text_surface.convert_alpha()
+
+    width = text_surface.get_width()
+    height = text_surface.get_height()
+
+    text_data = pygame.image.tostring(text_surface, "RGBA", True)
+
+    texture_id = glGenTextures(1)
+
+    glBindTexture(GL_TEXTURE_2D, texture_id)
+
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+
+    glTexImage2D(
+        GL_TEXTURE_2D,
+        0,
+        GL_RGBA,
+        width,
+        height,
+        0,
+        GL_RGBA,
+        GL_UNSIGNED_BYTE,
+        text_data
+    )
+
+    glEnable(GL_TEXTURE_2D)
+    glColor4f(1.0, 1.0, 1.0, 1.0)
+
+    glBegin(GL_QUADS)
+
+    glTexCoord2f(0.0, 1.0)
+    glVertex2f(x, y)
+
+    glTexCoord2f(1.0, 1.0)
+    glVertex2f(x + width, y)
+
+    glTexCoord2f(1.0, 0.0)
+    glVertex2f(x + width, y + height)
+
+    glTexCoord2f(0.0, 0.0)
+    glVertex2f(x, y + height)
+
+    glEnd()
+
+    glDisable(GL_TEXTURE_2D)
+
+    glBindTexture(GL_TEXTURE_2D, 0)
+    glDeleteTextures([texture_id])
+
+
+def draw_force_hud(aircraft, font, paused):
+    """
+    Draw force values only when paused.
+
+    When paused:
+        black background box
+        white text
+    """
+
+    if not DRAW_FORCE_HUD:
+        return
+
+    if not paused:
+        return
+
+    totals = force_totals_from_debug(aircraft)
+    speed = np.linalg.norm(aircraft.vel)
+
+    lines = [
+        "PAUSED - WORLD FRAME FORCE ANALYSIS",
+        f"speed = {speed:.2f} m/s    altitude = {aircraft.pos[2]:.2f} m    throttle = {aircraft.throttle:.2f}",
+        "",
+        format_force_line("gravity", totals["gravity"]),
+        format_force_line("drag", totals["drag"]),
+        format_force_line("lift", totals["lift"]),
+        format_force_line("thrust", totals["thrust"]),
+        format_force_line("total", totals["total"]),
+        "",
+        "red=gravity   magenta=drag   green=lift   orange=thrust",
+        "P: resume   F: force arrows   R: reset   3/4: tail angle",
+    ]
+
+    x = 16
+    y = 16
+    padding_x = 14
+    padding_y = 12
+
+    text_w = 0
+    for line in lines:
+        if line == "":
+            continue
+        text_w = max(text_w, font.size(line)[0])
+
+    box_w = text_w + padding_x * 2
+    box_h = len(lines) * HUD_LINE_SPACING + padding_y * 2
+
+    begin_2d_overlay()
+
+    draw_filled_rect_2d(
+        x,
+        y,
+        box_w,
+        box_h,
+        color=(0.0, 0.0, 0.0, 0.88)
+    )
+
+    # White border.
+    glColor4f(1.0, 1.0, 1.0, 1.0)
+    glLineWidth(2.0)
+    glBegin(GL_LINE_LOOP)
+    glVertex2f(x, y)
+    glVertex2f(x + box_w, y)
+    glVertex2f(x + box_w, y + box_h)
+    glVertex2f(x, y + box_h)
+    glEnd()
+    glLineWidth(1.0)
+
+    text_x = x + padding_x
+    text_y = y + padding_y
+
+    for i, line in enumerate(lines):
+        if line == "":
+            continue
+
+        draw_text_2d(
+            text_x,
+            text_y + i * HUD_LINE_SPACING,
+            line,
+            font,
+            color=(255, 255, 255)
+        )
+
+    end_2d_overlay()
+
+
+# ============================================================
 # Debug print
 # ============================================================
 
 def print_force_summary(aircraft, frame_count):
-    """
-    Print force magnitude summary occasionally.
-    This helps verify that OpenGL arrows match simulated forces.
-
-    Gravity should always print as:
-        [0.000, 0.000, negative]
-    """
-
     if frame_count % 60 != 0:
         return
 
@@ -1214,23 +1347,33 @@ def main():
     print_vtail_angle_comparison()
 
     pygame.init()
+    pygame.font.init()
 
     width, height = 1200, 800
     pygame.display.set_mode((width, height), DOUBLEBUF | OPENGL)
-    pygame.display.set_caption("Aircraft Simulation: World-Coordinate Force Arrows")
+    pygame.display.set_caption("Aircraft Simulation: Pause HUD + World Forces")
 
     setup_opengl(width, height)
 
     clock = pygame.time.Clock()
+
+    # Monospace font is better for aligned force values.
+    hud_font = pygame.font.SysFont("Consolas", HUD_FONT_SIZE)
+    if hud_font is None:
+        hud_font = pygame.font.Font(None, HUD_FONT_SIZE)
+
     aircraft = Aircraft()
 
+    # Generate force_debug before first physics step.
+    aircraft.compute_total_forces_and_torques()
+
     running = True
+    paused = False
     accumulator = 0.0
     frame_count = 0
 
     while running:
         frame_dt = clock.tick(60) / 1000.0
-        accumulator += frame_dt
         frame_count += 1
 
         for event in pygame.event.get():
@@ -1241,31 +1384,52 @@ def main():
                 if event.key == K_ESCAPE:
                     running = False
 
+                if event.key == K_p:
+                    paused = not paused
+                    print(f"PAUSED = {paused}")
+                    accumulator = 0.0
+
                 if event.key == K_r:
                     aircraft.reset()
+                    aircraft.compute_total_forces_and_torques()
+                    accumulator = 0.0
 
                 if event.key == K_3:
                     aircraft.set_tail_angle(30.0)
+                    aircraft.compute_total_forces_and_torques()
 
                 if event.key == K_4:
                     aircraft.set_tail_angle(45.0)
+                    aircraft.compute_total_forces_and_torques()
 
                 if event.key == K_f:
                     DRAW_FORCE_ARROWS = not DRAW_FORCE_ARROWS
                     print(f"DRAW_FORCE_ARROWS = {DRAW_FORCE_ARROWS}")
 
         keys = pygame.key.get_pressed()
-        aircraft.apply_controls(keys, frame_dt)
 
-        while accumulator >= DT:
-            aircraft.step(DT)
-            accumulator -= DT
+        if not paused:
+            accumulator += frame_dt
+
+            aircraft.apply_controls(keys, frame_dt)
+
+            while accumulator >= DT:
+                aircraft.step(DT)
+                accumulator -= DT
+
+        else:
+            # Keep arrows and HUD current while paused.
+            aircraft.compute_total_forces_and_torques()
+            accumulator = 0.0
 
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
         set_camera(aircraft)
         draw_ground()
         draw_aircraft(aircraft)
+
+        # Pause HUD appears only when paused.
+        draw_force_hud(aircraft, hud_font, paused)
 
         pygame.display.flip()
 
@@ -1275,8 +1439,10 @@ def main():
         roll, pitch, yaw = euler_from_rotmat(R)
         speed = np.linalg.norm(aircraft.vel)
 
+        pause_text = "PAUSED" if paused else "RUNNING"
+
         pygame.display.set_caption(
-            f"WORLD FORCE ARROWS | "
+            f"{pause_text} | WORLD FORCES + HUD | "
             f"tail={aircraft.tail_angle_deg:4.1f} deg | "
             f"force_arrows={DRAW_FORCE_ARROWS} | "
             f"speed={speed:5.2f} m/s | "
