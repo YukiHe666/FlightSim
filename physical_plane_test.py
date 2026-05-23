@@ -27,6 +27,13 @@ RHO = 1.225
 MU_AIR = 1.81e-5
 DT = 0.005
 
+INITIAL_ALTITUDE_M = 2.2
+INITIAL_VEL_KMH = 30
+
+
+INITIAL_VEL_MS = INITIAL_VEL_KMH/3.6
+
+
 DEG2RAD = math.pi / 180.0
 RAD2DEG = 180.0 / math.pi
 
@@ -42,12 +49,21 @@ MAX_FORCE_ARROW_LEN = 0.80
 
 
 # ============================================================
+# Ground size
+# ============================================================
+
+GROUND_HALF_SIZE = 150
+GROUND_GRID_STEP = 3
+
+
+# ============================================================
 # HUD display
 # ============================================================
 
 DRAW_FORCE_HUD = True
-HUD_FONT_SIZE = 18
-HUD_LINE_SPACING = 24
+
+HUD_FONT_SIZE = 13
+HUD_LINE_SPACING = 17
 
 
 # ============================================================
@@ -56,11 +72,22 @@ HUD_LINE_SPACING = 24
 
 TAIL_ANGLE_DEG = 30.0
 
-TAIL_SPAN_M = 0.32
+TAIL_SPAN_M = 0.35
 TAIL_HALF_SPAN_M = TAIL_SPAN_M / 2.0
 
 TAIL_ROOT_X = -0.90
 TAIL_ROOT_Z = 0.02
+
+
+# ============================================================
+# Internal battery pack
+# ============================================================
+
+BATTERY_MASS_KG = 3.0
+
+BATTERY_X = 0.16
+BATTERY_Y = 0.0
+BATTERY_Z = 0.0
 
 
 # ============================================================
@@ -311,7 +338,6 @@ class AircraftPart:
     ):
         self.name = name
         self.mass = mass_kg
-
         self.r_body = np.array(r_body, dtype=float)
 
         self.area = area_m2
@@ -328,8 +354,6 @@ class AircraftPart:
 
         self.is_lifting_surface = is_lifting_surface
         self.cd0 = cd0
-
-        # Positive deflection means trailing edge down.
         self.deflection = 0.0
 
 
@@ -346,22 +370,37 @@ class Aircraft:
 
         self.parts = []
         self.force_debug = []
+        self.reynolds_debug = {}
 
         self.tail_angle_deg = TAIL_ANGLE_DEG
         self.tail_angle_rad = self.tail_angle_deg * DEG2RAD
 
         self.parts.append(AircraftPart(
             name="fuselage",
-            mass_kg=2.0,
+            mass_kg=1.0,
             r_body=[0.25, 0.0, 0.0],
-            area_m2=0.035,
+            area_m2=0.14*0.5,
             chord_m=0.50,
-            span_m=0.12,
+            span_m=0.14,
             lift_axis_body=[0, 0, 1],
             span_axis_body=[0, 1, 0],
             is_lifting_surface=False,
             cd0=0.12
         ))
+
+        self.battery = AircraftPart(
+            name="battery",
+            mass_kg=BATTERY_MASS_KG,
+            r_body=[BATTERY_X, BATTERY_Y, BATTERY_Z],
+            area_m2=0.0,
+            chord_m=0.10,
+            span_m=0.10,
+            lift_axis_body=[0, 0, 1],
+            span_axis_body=[0, 1, 0],
+            is_lifting_surface=False,
+            cd0=0.0
+        )
+        self.parts.append(self.battery)
 
         self.parts.append(AircraftPart(
             name="rod",
@@ -380,9 +419,9 @@ class Aircraft:
             name="left_wing",
             mass_kg=0.25,
             r_body=[0.05, -0.35, 0.0],
-            area_m2=0.075,
-            chord_m=0.18,
-            span_m=0.65,
+            chord_m=0.25,
+            span_m=0.90,
+            area_m2=0.25*0.9,
             lift_axis_body=[0, 0, 1],
             span_axis_body=[0, -1, 0],
             is_lifting_surface=True,
@@ -393,9 +432,9 @@ class Aircraft:
             name="right_wing",
             mass_kg=0.25,
             r_body=[0.05, 0.35, 0.0],
-            area_m2=0.075,
-            chord_m=0.18,
-            span_m=0.65,
+            chord_m=0.25,
+            span_m=0.90,
+            area_m2=0.25*0.9,
             lift_axis_body=[0, 0, 1],
             span_axis_body=[0, 1, 0],
             is_lifting_surface=True,
@@ -408,13 +447,9 @@ class Aircraft:
         self.left_tail = AircraftPart(
             name="left_tail",
             mass_kg=0.1,
-            r_body=[
-                TAIL_ROOT_X,
-                -tail_center_y,
-                tail_center_z
-            ],
-            area_m2=0.030,
-            chord_m=0.12,
+            r_body=[TAIL_ROOT_X, -tail_center_y, tail_center_z],
+            area_m2=TAIL_SPAN_M*0.15,
+            chord_m=0.15,
             span_m=TAIL_SPAN_M,
             lift_axis_body=[0, 0, 1],
             span_axis_body=[
@@ -429,13 +464,9 @@ class Aircraft:
         self.right_tail = AircraftPart(
             name="right_tail",
             mass_kg=0.1,
-            r_body=[
-                TAIL_ROOT_X,
-                tail_center_y,
-                tail_center_z
-            ],
-            area_m2=0.030,
-            chord_m=0.12,
+            r_body=[TAIL_ROOT_X, tail_center_y, tail_center_z],
+            area_m2=TAIL_SPAN_M*0.15,
+            chord_m=0.15,
             span_m=TAIL_SPAN_M,
             lift_axis_body=[0, 0, 1],
             span_axis_body=[
@@ -455,22 +486,23 @@ class Aircraft:
         self.mass = sum(p.mass for p in self.parts)
         self.cg_body = self.compute_center_of_mass_body()
 
-        self.pos = np.array([0.0, 0.0, 20.0], dtype=float)
-        self.vel = np.array([18.0, 0.0, 0.0], dtype=float)
+        self.pos = np.array([0.0, 0.0, INITIAL_ALTITUDE_M], dtype=float)
+        self.vel = np.array([INITIAL_VEL_MS, 0.0, 0.0], dtype=float)
 
-        # Still air by default.
         self.wind_world = np.array([0.0, 0.0, 0.0], dtype=float)
 
         self.q = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
         self.omega_body = np.array([0.0, 0.0, 0.0], dtype=float)
 
         self.throttle = 0.45
-        self.max_thrust = 12.0
+
+        self.max_thrust = 30.0
 
         self.I_body = self.compute_inertia_tensor()
         self.I_body_inv = np.linalg.inv(self.I_body)
 
         self.print_current_tail_angle_data()
+        self.print_mass_balance_data()
 
     def compute_center_of_mass_body(self):
         weighted_sum = np.zeros(3, dtype=float)
@@ -483,23 +515,14 @@ class Aircraft:
     def compute_inertia_tensor(self):
         I = np.zeros((3, 3), dtype=float)
 
-        # Inertia around center of gravity, not body origin.
         for p in self.parts:
             r = p.r_body - self.cg_body
             I += p.mass * ((np.dot(r, r) * np.eye(3)) - np.outer(r, r))
 
-        # Small base inertia for numerical stability.
         I += np.diag([0.02, 0.08, 0.08])
-
         return I
 
     def add_force_debug(self, name, part_name, start_world, force_world, color):
-        """
-        Store exact force used by physics solver.
-
-        start_world and force_world are both WORLD coordinates.
-        """
-
         if np.linalg.norm(force_world) < 1e-8:
             return
 
@@ -510,6 +533,18 @@ class Aircraft:
             "force_world": force_world.copy(),
             "color": color
         })
+
+    def print_mass_balance_data(self):
+        print("\n" + "=" * 72)
+        print("MASS BALANCE WITH INTERNAL BATTERY")
+        print(f"battery mass = {BATTERY_MASS_KG:.3f} kg")
+        print(f"battery position body = [{BATTERY_X:.3f}, {BATTERY_Y:.3f}, {BATTERY_Z:.3f}] m")
+        print(f"total mass = {self.mass:.3f} kg")
+        print(f"CG body = [{self.cg_body[0]:.4f}, {self.cg_body[1]:.4f}, {self.cg_body[2]:.4f}] m")
+        print(f"total weight = {self.mass * G:.3f} N")
+        print(f"initial altitude = {INITIAL_ALTITUDE_M:.1f} m")
+        print("Battery is internal: no lift, no drag, only mass/CG/inertia.")
+        print("=" * 72 + "\n")
 
     def print_current_tail_angle_data(self):
         vertical_lift_fraction = math.cos(self.tail_angle_rad)
@@ -524,7 +559,6 @@ class Aircraft:
         print(f"Current V-tail angle = {self.tail_angle_deg:.1f} deg")
         print(f"left_tail center  = {self.left_tail.r_body}")
         print(f"right_tail center = {self.right_tail.r_body}")
-        print(f"center of gravity = {self.cg_body}")
         print(f"vertical lift fraction ≈ {vertical_lift_fraction:.3f}")
         print(f"side force fraction    ≈ {side_force_fraction:.3f}")
         print(f"pitch/yaw ratio        ≈ {pitch_yaw_ratio:.3f}")
@@ -537,17 +571,14 @@ class Aircraft:
         tail_center_y = math.cos(self.tail_angle_rad) * TAIL_HALF_SPAN_M
         tail_center_z = TAIL_ROOT_Z + math.sin(self.tail_angle_rad) * TAIL_HALF_SPAN_M
 
-        self.left_tail.r_body = np.array([
-            TAIL_ROOT_X,
-            -tail_center_y,
-            tail_center_z
-        ], dtype=float)
-
-        self.right_tail.r_body = np.array([
-            TAIL_ROOT_X,
-            tail_center_y,
-            tail_center_z
-        ], dtype=float)
+        self.left_tail.r_body = np.array(
+            [TAIL_ROOT_X, -tail_center_y, tail_center_z],
+            dtype=float
+        )
+        self.right_tail.r_body = np.array(
+            [TAIL_ROOT_X, tail_center_y, tail_center_z],
+            dtype=float
+        )
 
         self.left_tail.span_axis_body = norm(np.array([
             0,
@@ -568,7 +599,7 @@ class Aircraft:
         self.print_current_tail_angle_data()
 
     def reset(self):
-        self.pos = np.array([0.0, 0.0, 20.0], dtype=float)
+        self.pos = np.array([0.0, 0.0, INITIAL_ALTITUDE_M], dtype=float)
         self.vel = np.array([18.0, 0.0, 0.0], dtype=float)
         self.q = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
         self.omega_body = np.array([0.0, 0.0, 0.0], dtype=float)
@@ -579,6 +610,10 @@ class Aircraft:
         self.right_tail.deflection = 0.0
 
         self.throttle = 0.45
+
+        self.cg_body = self.compute_center_of_mass_body()
+        self.I_body = self.compute_inertia_tensor()
+        self.I_body_inv = np.linalg.inv(self.I_body)
 
     def apply_controls(self, keys, dt):
         flap_rate = 30.0 * DEG2RAD
@@ -624,17 +659,6 @@ class Aircraft:
             self.right_wing.deflection *= 0.95
 
     def compute_part_forces(self, part, R):
-        """
-        Compute actual forces acting on one aircraft part.
-
-        All force arrows are stored and displayed in WORLD coordinates.
-
-        Forces:
-            gravity: world -Z
-            drag: opposite local relative air velocity
-            lift: perpendicular to local relative velocity and span
-        """
-
         r_body_from_origin = part.r_body
         r_body_from_cg = part.r_body - self.cg_body
 
@@ -645,10 +669,7 @@ class Aircraft:
 
         omega_world = R @ self.omega_body
 
-        # Local part velocity = translation + rotation around CG.
         v_part_world = self.vel + np.cross(omega_world, r_world_from_cg)
-
-        # Velocity relative to surrounding air.
         v_rel_world = v_part_world - self.wind_world
         speed = np.linalg.norm(v_rel_world)
 
@@ -657,10 +678,7 @@ class Aircraft:
         else:
             v_rel_hat_world = np.zeros(3)
 
-        # =====================================================
         # Gravity
-        # =====================================================
-
         F_gravity_world = np.array([0.0, 0.0, -part.mass * G])
 
         self.add_force_debug(
@@ -671,20 +689,14 @@ class Aircraft:
             color=(1.0, 0.1, 0.1)
         )
 
-        # =====================================================
         # Drag
-        # =====================================================
-
         F_drag_world = np.zeros(3)
 
-        if speed > 0.1:
+        if speed > 0.1 and part.area > 1e-9:
             q_dyn = 0.5 * RHO * speed * speed
             F_drag_world = -q_dyn * part.cd0 * part.area * v_rel_hat_world
 
-        # =====================================================
         # Lift
-        # =====================================================
-
         F_lift_world = np.zeros(3)
 
         if part.is_lifting_surface and speed > 0.1:
@@ -694,11 +706,17 @@ class Aircraft:
             vz = v_rel_body[2]
 
             alpha = math.atan2(-vz, max(abs(vx), 1e-3))
-
             alpha_eff = alpha + part.deflection
             alpha_eff_deg = alpha_eff * RAD2DEG
 
             Re = RHO * speed * part.chord / MU_AIR
+
+            self.reynolds_debug[part.name] = {
+                "Re": Re,
+                "speed": speed,
+                "chord": part.chord,
+                "alpha_deg": alpha_eff_deg,
+            }
 
             CL_2D, CD_2D = self.airfoil_table.lookup(Re, alpha_eff_deg)
 
@@ -743,7 +761,6 @@ class Aircraft:
 
         F_total_world = F_gravity_world + F_drag_world + F_lift_world
 
-        # Convert to body frame only for rotational dynamics.
         F_total_body = R.T @ F_total_world
         tau_body = np.cross(r_body_from_cg, F_total_body)
 
@@ -756,15 +773,12 @@ class Aircraft:
         tau_total_body = np.zeros(3)
 
         self.force_debug = []
+        self.reynolds_debug = {}
 
         for part in self.parts:
             F_world, tau_body = self.compute_part_forces(part, R)
             F_total_world += F_world
             tau_total_body += tau_body
-
-        # =====================================================
-        # Thrust
-        # =====================================================
 
         thrust_body = np.array([
             self.max_thrust * self.throttle,
@@ -793,7 +807,6 @@ class Aircraft:
             color=(1.0, 0.6, 0.0)
         )
 
-        # Angular damping.
         tau_total_body += -0.45 * self.omega_body
 
         return F_total_world, tau_total_body
@@ -801,7 +814,6 @@ class Aircraft:
     def step(self, dt):
         F_world, tau_body = self.compute_total_forces_and_torques()
 
-        # Linear dynamics in WORLD frame.
         acc_world = F_world / self.mass
 
         self.vel += acc_world * dt
@@ -816,7 +828,6 @@ class Aircraft:
             self.vel[0] *= 0.96
             self.vel[1] *= 0.96
 
-        # Rotational dynamics in BODY frame.
         I = self.I_body
         Iomega = I @ self.omega_body
 
@@ -944,9 +955,11 @@ def draw_aircraft(aircraft):
     glPushMatrix()
     glMultMatrixf(M.T)
 
+    # Body origin marker.
     glColor3f(1.0, 1.0, 0.0)
     draw_box([0.05, 0.05, 0.05])
 
+    # CG marker.
     glPushMatrix()
     glTranslatef(
         aircraft.cg_body[0],
@@ -957,6 +970,7 @@ def draw_aircraft(aircraft):
     draw_box([0.045, 0.045, 0.045])
     glPopMatrix()
 
+    # Tail root connector.
     glPushMatrix()
     glTranslatef(TAIL_ROOT_X, 0.0, TAIL_ROOT_Z)
     glColor3f(0.8, 0.8, 0.8)
@@ -970,6 +984,10 @@ def draw_aircraft(aircraft):
         if p.name == "fuselage":
             glColor3f(0.75, 0.75, 0.75)
             draw_box([0.65, 0.12, 0.12])
+
+        elif p.name == "battery":
+            glColor3f(0.02, 0.02, 0.02)
+            draw_box([0.14, 0.07, 0.05])
 
         elif p.name == "rod":
             glColor3f(0.55, 0.55, 0.55)
@@ -1009,20 +1027,25 @@ def draw_aircraft(aircraft):
 
     glPopMatrix()
 
-    # Force arrows are drawn after leaving aircraft transform.
     draw_force_arrows(aircraft)
 
 
 def draw_ground():
+    size = GROUND_HALF_SIZE
+    step = GROUND_GRID_STEP
+
+    # Only gray grid, no colored X/Y axis lines.
     glColor3f(0.25, 0.25, 0.25)
 
     glBegin(GL_LINES)
-    for i in range(-50, 51):
-        glVertex3f(i, -50, 0)
-        glVertex3f(i, 50, 0)
 
-        glVertex3f(-50, i, 0)
-        glVertex3f(50, i, 0)
+    for i in range(-size, size + 1, step):
+        glVertex3f(i, -size, 0)
+        glVertex3f(i, size, 0)
+
+        glVertex3f(-size, i, 0)
+        glVertex3f(size, i, 0)
+
     glEnd()
 
 
@@ -1041,10 +1064,6 @@ def setup_opengl(width, height):
 
 
 def set_camera(aircraft):
-    """
-    Camera follows aircraft but uses world-up, not aircraft-up.
-    """
-
     glMatrixMode(GL_MODELVIEW)
     glLoadIdentity()
 
@@ -1052,7 +1071,8 @@ def set_camera(aircraft):
     forward = R @ np.array([1.0, 0.0, 0.0])
 
     target = aircraft.pos
-    cam_pos = aircraft.pos - forward * 5.0 + np.array([0.0, 0.0, 2.0])
+
+    cam_pos = aircraft.pos - forward * 8.0 + np.array([0.0, 0.0, 3.0])
 
     world_up = np.array([0.0, 0.0, 1.0])
 
@@ -1068,11 +1088,6 @@ def set_camera(aircraft):
 # ============================================================
 
 def force_totals_from_debug(aircraft):
-    """
-    Sum current forces from aircraft.force_debug.
-    All forces are already stored in WORLD coordinates.
-    """
-
     totals = {
         "gravity": np.zeros(3),
         "drag": np.zeros(3),
@@ -1099,23 +1114,30 @@ def format_force_line(name, F):
     mag = np.linalg.norm(F)
 
     return (
-        f"{name:<8s} "
-        f"Fx={F[0]:8.2f}  "
-        f"Fy={F[1]:8.2f}  "
-        f"Fz={F[2]:8.2f}  "
-        f"|F|={mag:8.2f} N"
+        f"{name:<7s} "
+        f"Fx={F[0]:7.2f} "
+        f"Fy={F[1]:7.2f} "
+        f"Fz={F[2]:7.2f} "
+        f"|F|={mag:7.2f}N"
+    )
+
+
+def format_reynolds_line(part_name, data):
+    Re = data["Re"]
+    speed = data["speed"]
+    chord = data["chord"]
+    alpha = data["alpha_deg"]
+
+    return (
+        f"{part_name:<10s} "
+        f"Re={Re:8.0f} "
+        f"V={speed:5.2f} "
+        f"c={chord:4.2f} "
+        f"a={alpha:6.2f}"
     )
 
 
 def begin_2d_overlay():
-    """
-    Switch OpenGL into 2D screen-coordinate mode.
-
-    Coordinates:
-        x = pixels from left
-        y = pixels from top
-    """
-
     viewport = glGetIntegerv(GL_VIEWPORT)
     width = viewport[2]
     height = viewport[3]
@@ -1150,12 +1172,6 @@ def end_2d_overlay():
 
 
 def draw_filled_rect_2d(x, y, w, h, color):
-    """
-    Draw a solid 2D rectangle.
-
-    color = (r, g, b, a), each from 0.0 to 1.0
-    """
-
     glColor4f(color[0], color[1], color[2], color[3])
 
     glBegin(GL_QUADS)
@@ -1167,12 +1183,6 @@ def draw_filled_rect_2d(x, y, w, h, color):
 
 
 def draw_text_2d(x, y, text, font, color=(255, 255, 255)):
-    """
-    Draw text using an OpenGL texture.
-
-    This avoids the white-rectangle problem caused by glDrawPixels.
-    """
-
     text_surface = font.render(text, True, color)
     text_surface = text_surface.convert_alpha()
 
@@ -1226,14 +1236,6 @@ def draw_text_2d(x, y, text, font, color=(255, 255, 255)):
 
 
 def draw_force_hud(aircraft, font, paused):
-    """
-    Draw force values only when paused.
-
-    When paused:
-        black background box
-        white text
-    """
-
     if not DRAW_FORCE_HUD:
         return
 
@@ -1244,8 +1246,10 @@ def draw_force_hud(aircraft, font, paused):
     speed = np.linalg.norm(aircraft.vel)
 
     lines = [
-        "PAUSED - WORLD FRAME FORCE ANALYSIS",
-        f"speed = {speed:.2f} m/s    altitude = {aircraft.pos[2]:.2f} m    throttle = {aircraft.throttle:.2f}",
+        "PAUSED - FORCE ANALYSIS",
+        f"speed={speed:.2f} m/s  alt={aircraft.pos[2]:.2f} m  thr={aircraft.throttle:.2f}",
+        f"battery={BATTERY_MASS_KG:.1f} kg  x={BATTERY_X:.3f} m  mass={aircraft.mass:.2f} kg",
+        f"CG=[{aircraft.cg_body[0]:.3f}, {aircraft.cg_body[1]:.3f}, {aircraft.cg_body[2]:.3f}] m",
         "",
         format_force_line("gravity", totals["gravity"]),
         format_force_line("drag", totals["drag"]),
@@ -1253,14 +1257,17 @@ def draw_force_hud(aircraft, font, paused):
         format_force_line("thrust", totals["thrust"]),
         format_force_line("total", totals["total"]),
         "",
-        "red=gravity   magenta=drag   green=lift   orange=thrust",
-        "P: resume   F: force arrows   R: reset   3/4: tail angle",
+        "REYNOLDS NUMBER",
     ]
 
-    x = 16
-    y = 16
-    padding_x = 14
-    padding_y = 12
+    for part_name in ["left_wing", "right_wing", "left_tail", "right_tail"]:
+        if part_name in aircraft.reynolds_debug:
+            lines.append(format_reynolds_line(part_name, aircraft.reynolds_debug[part_name]))
+
+    x = 12
+    y = 12
+    padding_x = 9
+    padding_y = 8
 
     text_w = 0
     for line in lines:
@@ -1278,12 +1285,11 @@ def draw_force_hud(aircraft, font, paused):
         y,
         box_w,
         box_h,
-        color=(0.0, 0.0, 0.0, 0.88)
+        color=(0.0, 0.0, 0.0, 0.82)
     )
 
-    # White border.
-    glColor4f(1.0, 1.0, 1.0, 1.0)
-    glLineWidth(2.0)
+    glColor4f(1.0, 1.0, 1.0, 0.95)
+    glLineWidth(1.5)
     glBegin(GL_LINE_LOOP)
     glVertex2f(x, y)
     glVertex2f(x + box_w, y)
@@ -1334,6 +1340,19 @@ def print_force_summary(aircraft, frame_count):
             f"|F| = {mag:8.3f} N"
         )
 
+    if aircraft.reynolds_debug:
+        print("\nREYNOLDS NUMBER")
+        for part_name in ["left_wing", "right_wing", "left_tail", "right_tail"]:
+            if part_name in aircraft.reynolds_debug:
+                data = aircraft.reynolds_debug[part_name]
+                print(
+                    f"{part_name:12s} | "
+                    f"Re={data['Re']:10.0f} | "
+                    f"V={data['speed']:7.3f} m/s | "
+                    f"c={data['chord']:5.3f} m | "
+                    f"alpha={data['alpha_deg']:7.3f} deg"
+                )
+
     print("-" * 88)
 
 
@@ -1351,20 +1370,17 @@ def main():
 
     width, height = 1200, 800
     pygame.display.set_mode((width, height), DOUBLEBUF | OPENGL)
-    pygame.display.set_caption("Aircraft Simulation: Pause HUD + World Forces")
+    pygame.display.set_caption("Aircraft Simulation: Higher Altitude + Gray Grid")
 
     setup_opengl(width, height)
 
     clock = pygame.time.Clock()
 
-    # Monospace font is better for aligned force values.
     hud_font = pygame.font.SysFont("Consolas", HUD_FONT_SIZE)
     if hud_font is None:
         hud_font = pygame.font.Font(None, HUD_FONT_SIZE)
 
     aircraft = Aircraft()
-
-    # Generate force_debug before first physics step.
     aircraft.compute_total_forces_and_torques()
 
     running = True
@@ -1418,7 +1434,6 @@ def main():
                 accumulator -= DT
 
         else:
-            # Keep arrows and HUD current while paused.
             aircraft.compute_total_forces_and_torques()
             accumulator = 0.0
 
@@ -1428,7 +1443,6 @@ def main():
         draw_ground()
         draw_aircraft(aircraft)
 
-        # Pause HUD appears only when paused.
         draw_force_hud(aircraft, hud_font, paused)
 
         pygame.display.flip()
@@ -1442,17 +1456,18 @@ def main():
         pause_text = "PAUSED" if paused else "RUNNING"
 
         pygame.display.set_caption(
-            f"{pause_text} | WORLD FORCES + HUD | "
+            f"{pause_text} | HIGH ALT + GRAY GRID | "
             f"tail={aircraft.tail_angle_deg:4.1f} deg | "
+            f"bat_x={BATTERY_X:5.2f} m | "
+            f"CGx={aircraft.cg_body[0]:5.3f} m | "
+            f"mass={aircraft.mass:4.2f} kg | "
             f"force_arrows={DRAW_FORCE_ARROWS} | "
             f"speed={speed:5.2f} m/s | "
             f"alt={aircraft.pos[2]:5.2f} m | "
             f"thr={aircraft.throttle:4.2f} | "
             f"roll={roll:6.2f} deg | "
             f"pitch={pitch:6.2f} deg | "
-            f"yaw={yaw:6.2f} deg | "
-            f"L flap={aircraft.left_wing.deflection * RAD2DEG:6.2f} deg | "
-            f"R flap={aircraft.right_wing.deflection * RAD2DEG:6.2f} deg"
+            f"yaw={yaw:6.2f} deg"
         )
 
     pygame.quit()
