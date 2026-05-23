@@ -1,5 +1,7 @@
 import math
 import re
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pygame
@@ -7,6 +9,13 @@ from pygame.locals import *
 
 from OpenGL.GL import *
 from OpenGL.GLU import *
+
+
+# ============================================================
+# File path
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
 
 
 # ============================================================
@@ -23,6 +32,19 @@ RAD2DEG = 180.0 / math.pi
 
 
 # ============================================================
+# Force arrow visualization
+# ============================================================
+
+DRAW_FORCE_ARROWS = True
+
+# Arrow length scale: meters per Newton in OpenGL world frame.
+FORCE_ARROW_SCALE = 0.15
+
+# Limit arrow length to avoid huge arrows.
+MAX_FORCE_ARROW_LEN = 0.80
+
+
+# ============================================================
 # V-tail geometry
 # ============================================================
 
@@ -32,8 +54,6 @@ TAIL_ANGLE_DEG = 30.0
 TAIL_SPAN_M = 0.32
 TAIL_HALF_SPAN_M = TAIL_SPAN_M / 2.0
 
-# Rod center is x = -0.45, rod length is 0.90,
-# so the rear end of the rod is approximately x = -0.90.
 TAIL_ROOT_X = -0.90
 TAIL_ROOT_Z = 0.02
 
@@ -89,9 +109,11 @@ def print_vtail_angle_comparison():
     print("OpenGL controls:")
     print("Press 3: switch V-tail to 30 degrees")
     print("Press 4: switch V-tail to 45 degrees")
+    print("Press F: show/hide force arrows")
     print("Press R: reset aircraft state")
     print("W/S: both main wings down/up")
     print("A/D: left/right turn input")
+    print("UP/DOWN: throttle")
     print("=" * 88 + "\n")
 
 
@@ -127,10 +149,10 @@ def quat_multiply(q1, q2):
     w2, x2, y2, z2 = q2
 
     return np.array([
-        w1*w2 - x1*x2 - y1*y2 - z1*z2,
-        w1*x2 + x1*w2 + y1*z2 - z1*y2,
-        w1*y2 - x1*z2 + y1*w2 + z1*x2,
-        w1*z2 + x1*y2 - y1*x2 + z1*w2
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
     ], dtype=float)
 
 
@@ -139,9 +161,9 @@ def quat_to_rotmat(q):
     w, x, y, z = q
 
     return np.array([
-        [1 - 2*y*y - 2*z*z,     2*x*y - 2*z*w,       2*x*z + 2*y*w],
-        [2*x*y + 2*z*w,         1 - 2*x*x - 2*z*z,   2*y*z - 2*x*w],
-        [2*x*z - 2*y*w,         2*y*z + 2*x*w,       1 - 2*x*x - 2*y*y]
+        [1 - 2 * y * y - 2 * z * z,     2 * x * y - 2 * z * w,       2 * x * z + 2 * y * w],
+        [2 * x * y + 2 * z * w,         1 - 2 * x * x - 2 * z * z,   2 * y * z - 2 * x * w],
+        [2 * x * z - 2 * y * w,         2 * y * z + 2 * x * w,       1 - 2 * x * x - 2 * y * y]
     ], dtype=float)
 
 
@@ -312,11 +334,12 @@ class AircraftPart:
 class Aircraft:
     def __init__(self):
         self.airfoil_table = Flow5PolarTable(
-            cl_csv_path="CL&α_Polar_Graph.csv",
-            cd_csv_path="Cd&α_Polar_Graph.csv"
+            cl_csv_path=str(BASE_DIR / "CL&α_Polar_Graph.csv"),
+            cd_csv_path=str(BASE_DIR / "Cd&α_Polar_Graph.csv")
         )
 
         self.parts = []
+        self.force_debug = []
 
         self.tail_angle_deg = TAIL_ANGLE_DEG
         self.tail_angle_rad = self.tail_angle_deg * DEG2RAD
@@ -326,7 +349,12 @@ class Aircraft:
         # +y = aircraft right
         # +z = aircraft upward
         #
-        # Origin = connection point between fuselage and rod.
+        # World frame:
+        # +x = initial forward direction
+        # +y = horizontal side direction
+        # +z = vertical upward
+        #
+        # All forces in force_debug are stored in WORLD frame.
 
         self.parts.append(AircraftPart(
             name="fuselage",
@@ -380,7 +408,6 @@ class Aircraft:
             cd0=0.035
         )
 
-        # Initial V-tail center and axis
         tail_center_y = math.cos(self.tail_angle_rad) * TAIL_HALF_SPAN_M
         tail_center_z = TAIL_ROOT_Z + math.sin(self.tail_angle_rad) * TAIL_HALF_SPAN_M
 
@@ -432,9 +459,14 @@ class Aircraft:
         self.parts.append(self.right_tail)
 
         self.mass = sum(p.mass for p in self.parts)
+        self.cg_body = self.compute_center_of_mass_body()
 
         self.pos = np.array([0.0, 0.0, 20.0], dtype=float)
         self.vel = np.array([18.0, 0.0, 0.0], dtype=float)
+
+        # Still air by default.
+        # Drag is opposite to velocity relative to this wind field.
+        self.wind_world = np.array([0.0, 0.0, 0.0], dtype=float)
 
         self.q = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
         self.omega_body = np.array([0.0, 0.0, 0.0], dtype=float)
@@ -446,6 +478,51 @@ class Aircraft:
         self.I_body_inv = np.linalg.inv(self.I_body)
 
         self.print_current_tail_angle_data()
+
+    def compute_center_of_mass_body(self):
+        weighted_sum = np.zeros(3, dtype=float)
+
+        for p in self.parts:
+            weighted_sum += p.mass * p.r_body
+
+        return weighted_sum / self.mass
+
+    def compute_inertia_tensor(self):
+        I = np.zeros((3, 3), dtype=float)
+
+        # Inertia around center of gravity, not body origin.
+        for p in self.parts:
+            r = p.r_body - self.cg_body
+            I += p.mass * ((np.dot(r, r) * np.eye(3)) - np.outer(r, r))
+
+        # Small base inertia for numerical stability.
+        I += np.diag([0.02, 0.08, 0.08])
+
+        return I
+
+    def add_force_debug(self, name, part_name, start_world, force_world, color):
+        """
+        Store the exact force used by the physics solver.
+
+        start_world:
+            Application point in WORLD frame.
+
+        force_world:
+            Force vector in WORLD frame.
+
+        OpenGL arrows are drawn directly from these world-frame values.
+        """
+
+        if np.linalg.norm(force_world) < 1e-8:
+            return
+
+        self.force_debug.append({
+            "name": name,
+            "part_name": part_name,
+            "start_world": start_world.copy(),
+            "force_world": force_world.copy(),
+            "color": color
+        })
 
     def print_current_tail_angle_data(self):
         vertical_lift_fraction = math.cos(self.tail_angle_rad)
@@ -460,6 +537,7 @@ class Aircraft:
         print(f"Current V-tail angle = {self.tail_angle_deg:.1f} deg")
         print(f"left_tail center  = {self.left_tail.r_body}")
         print(f"right_tail center = {self.right_tail.r_body}")
+        print(f"center of gravity = {self.cg_body}")
         print(f"vertical lift fraction ≈ {vertical_lift_fraction:.3f}")
         print(f"side force fraction    ≈ {side_force_fraction:.3f}")
         print(f"pitch/yaw ratio        ≈ {pitch_yaw_ratio:.3f}")
@@ -496,7 +574,7 @@ class Aircraft:
             math.sin(self.tail_angle_rad)
         ], dtype=float))
 
-        # Geometry changed, so recompute inertia.
+        self.cg_body = self.compute_center_of_mass_body()
         self.I_body = self.compute_inertia_tensor()
         self.I_body_inv = np.linalg.inv(self.I_body)
 
@@ -515,19 +593,7 @@ class Aircraft:
 
         self.throttle = 0.45
 
-    def compute_inertia_tensor(self):
-        I = np.zeros((3, 3), dtype=float)
-
-        for p in self.parts:
-            r = p.r_body
-            I += p.mass * ((np.dot(r, r) * np.eye(3)) - np.outer(r, r))
-
-        I += np.diag([0.02, 0.08, 0.08])
-
-        return I
-
     def apply_controls(self, keys, dt):
-        # Reduced sensitivity
         flap_rate = 30.0 * DEG2RAD
         max_flap = 12.0 * DEG2RAD
 
@@ -574,42 +640,93 @@ class Aircraft:
 
         self.throttle = clamp(self.throttle, 0.0, 1.0)
 
-        # Faster return to neutral when no key is pressed
+        # Return to neutral when no key is pressed.
         if not (keys[K_w] or keys[K_s] or keys[K_a] or keys[K_d]):
             self.left_wing.deflection *= 0.95
             self.right_wing.deflection *= 0.95
 
     def compute_part_forces(self, part, R):
-        r_world = R @ part.r_body
+        """
+        Compute actual forces acting on one aircraft part.
+
+        Important:
+        All forces here are stored and visualized in WORLD COORDINATES.
+
+        Forces:
+            gravity: world -Z
+            drag: opposite to local relative air velocity
+            lift: perpendicular to local relative velocity and span direction
+        """
+
+        r_body_from_origin = part.r_body
+        r_body_from_cg = part.r_body - self.cg_body
+
+        r_world_from_origin = R @ r_body_from_origin
+        r_world_from_cg = R @ r_body_from_cg
+
+        part_pos_world = self.pos + r_world_from_origin
+
         omega_world = R @ self.omega_body
 
-        v_part_world = self.vel + np.cross(omega_world, r_world)
-        speed = np.linalg.norm(v_part_world)
+        # Local velocity of this part:
+        # aircraft translation + rotational velocity around CG.
+        v_part_world = self.vel + np.cross(omega_world, r_world_from_cg)
+
+        # Relative velocity between the part and the air.
+        # If wind_world = 0, this is just velocity through still air.
+        v_rel_world = v_part_world - self.wind_world
+        speed = np.linalg.norm(v_rel_world)
 
         if speed > 0.1:
-            v_hat_world = v_part_world / speed
+            v_rel_hat_world = v_rel_world / speed
         else:
-            v_hat_world = np.zeros(3)
+            v_rel_hat_world = np.zeros(3)
 
-        # Gravity
+        # =====================================================
+        # 1. Gravity
+        # =====================================================
+
+        # Gravity is always vertical downward in WORLD frame.
+        # This should ALWAYS be [0, 0, negative].
         F_gravity_world = np.array([0.0, 0.0, -part.mass * G])
 
-        # Basic drag for every part
+        self.add_force_debug(
+            name="gravity",
+            part_name=part.name,
+            start_world=part_pos_world + np.array([0.00, 0.00, 0.00]),
+            force_world=F_gravity_world,
+            color=(1.0, 0.1, 0.1)
+        )
+
+        # =====================================================
+        # 2. Drag
+        # =====================================================
+
         F_drag_world = np.zeros(3)
+
         if speed > 0.1:
             q_dyn = 0.5 * RHO * speed * speed
-            F_drag_world = -q_dyn * part.cd0 * part.area * v_hat_world
+
+            # Basic drag for non-lifting parts.
+            # Direction is always opposite local relative velocity.
+            F_drag_world = -q_dyn * part.cd0 * part.area * v_rel_hat_world
+
+        # =====================================================
+        # 3. Lift
+        # =====================================================
 
         F_lift_world = np.zeros(3)
 
         if part.is_lifting_surface and speed > 0.1:
-            v_body = R.T @ v_part_world
+            v_rel_body = R.T @ v_rel_world
 
-            vx = v_body[0]
-            vz = v_body[2]
+            vx = v_rel_body[0]
+            vz = v_rel_body[2]
 
+            # Angle of attack.
             alpha = math.atan2(-vz, max(abs(vx), 1e-3))
 
+            # Control surface deflection changes effective angle of attack.
             alpha_eff = alpha + part.deflection
             alpha_eff_deg = alpha_eff * RAD2DEG
 
@@ -620,19 +737,26 @@ class Aircraft:
             AR = max(part.aspect_ratio, 0.1)
             e = 0.75
 
+            # Finite-wing correction.
             CL = CL_2D / (1.0 + abs(CL_2D) / (math.pi * e * AR))
+
+            # Induced drag.
             CD_induced = CL * CL / (math.pi * e * AR)
             CD = CD_2D + CD_induced
 
             q_dyn = 0.5 * RHO * speed * speed
 
-            F_drag_world = -q_dyn * CD * part.area * v_hat_world
+            # For lifting surfaces, replace simple drag with polar-based drag.
+            F_drag_world = -q_dyn * CD * part.area * v_rel_hat_world
 
-            # Lift direction is perpendicular to velocity and span direction.
+            # Lift direction in WORLD frame.
+            # Lift is perpendicular to velocity and span.
             span_world = R @ part.span_axis_body
-            lift_dir_world = np.cross(span_world, v_hat_world)
+
+            lift_dir_world = np.cross(v_rel_hat_world, span_world)
             lift_dir_world = norm(lift_dir_world)
 
+            # Choose the lift direction closer to aircraft body-up.
             body_up_world = R @ np.array([0.0, 0.0, 1.0])
 
             if np.dot(lift_dir_world, body_up_world) < 0:
@@ -640,10 +764,36 @@ class Aircraft:
 
             F_lift_world = q_dyn * CL * part.area * lift_dir_world
 
+        # Record drag after possible polar-based replacement.
+        self.add_force_debug(
+            name="drag",
+            part_name=part.name,
+            start_world=part_pos_world + np.array([-0.04, 0.00, 0.00]),
+            force_world=F_drag_world,
+            color=(1.0, 0.0, 1.0)
+        )
+
+        # Record lift.
+        self.add_force_debug(
+            name="lift",
+            part_name=part.name,
+            start_world=part_pos_world + np.array([0.04, 0.00, 0.00]),
+            force_world=F_lift_world,
+            color=(0.1, 1.0, 0.1)
+        )
+
+        # =====================================================
+        # 4. Total force and torque
+        # =====================================================
+
         F_total_world = F_gravity_world + F_drag_world + F_lift_world
 
-        F_body = R.T @ F_total_world
-        tau_body = np.cross(part.r_body, F_body)
+        # Torque about center of gravity.
+        #
+        # Convert total force to body frame only for rotational dynamics.
+        # This does NOT affect the displayed arrows.
+        F_total_body = R.T @ F_total_world
+        tau_body = np.cross(r_body_from_cg, F_total_body)
 
         return F_total_world, tau_body
 
@@ -653,22 +803,50 @@ class Aircraft:
         F_total_world = np.zeros(3)
         tau_total_body = np.zeros(3)
 
+        # Clear debug force list every physics step.
+        self.force_debug = []
+
+        # Forces on each aircraft part.
         for part in self.parts:
             F_world, tau_body = self.compute_part_forces(part, R)
+
             F_total_world += F_world
             tau_total_body += tau_body
 
-        # Thrust along body +x
-        thrust_body = np.array([self.max_thrust * self.throttle, 0.0, 0.0])
+        # =====================================================
+        # Thrust
+        # =====================================================
+
+        # Thrust is defined in body frame along aircraft nose direction.
+        thrust_body = np.array([
+            self.max_thrust * self.throttle,
+            0.0,
+            0.0
+        ])
+
+        # Convert thrust to WORLD frame for force accumulation and drawing.
         thrust_world = R @ thrust_body
 
         thrust_pos_body = np.array([0.35, 0.0, 0.0])
-        thrust_tau_body = np.cross(thrust_pos_body, thrust_body)
+        thrust_pos_world = self.pos + R @ thrust_pos_body
+
+        thrust_tau_body = np.cross(
+            thrust_pos_body - self.cg_body,
+            thrust_body
+        )
 
         F_total_world += thrust_world
         tau_total_body += thrust_tau_body
 
-        # Increased angular damping
+        self.add_force_debug(
+            name="thrust",
+            part_name="engine",
+            start_world=thrust_pos_world,
+            force_world=thrust_world,
+            color=(1.0, 0.6, 0.0)
+        )
+
+        # Angular damping.
         tau_total_body += -0.45 * self.omega_body
 
         return F_total_world, tau_total_body
@@ -676,13 +854,13 @@ class Aircraft:
     def step(self, dt):
         F_world, tau_body = self.compute_total_forces_and_torques()
 
-        # Linear dynamics
+        # Linear dynamics in WORLD frame.
         acc_world = F_world / self.mass
 
         self.vel += acc_world * dt
         self.pos += self.vel * dt
 
-        # Simple ground collision
+        # Simple ground collision.
         if self.pos[2] < 0.3:
             self.pos[2] = 0.3
 
@@ -692,7 +870,7 @@ class Aircraft:
             self.vel[0] *= 0.96
             self.vel[1] *= 0.96
 
-        # Rotational dynamics
+        # Rotational dynamics in BODY frame.
         I = self.I_body
         Iomega = I @ self.omega_body
 
@@ -702,7 +880,6 @@ class Aircraft:
 
         self.omega_body += omega_dot * dt
 
-        # Reduced maximum angular velocity
         max_omega = 3.0
         wmag = np.linalg.norm(self.omega_body)
 
@@ -716,12 +893,109 @@ class Aircraft:
 # OpenGL drawing
 # ============================================================
 
+def draw_arrow_world(start_world, force_world, scale, color):
+    """
+    Draw a force arrow directly in WORLD coordinates.
+
+    No aircraft body transform is active when this function is called.
+    Therefore:
+        gravity [0, 0, -mg] will always point world-down.
+    """
+
+    force_mag = np.linalg.norm(force_world)
+
+    if force_mag < 1e-6:
+        return
+
+    direction = force_world / force_mag
+
+    arrow_len = force_mag * scale
+    arrow_len = min(arrow_len, MAX_FORCE_ARROW_LEN)
+
+    end_world = start_world + direction * arrow_len
+
+    glColor3f(color[0], color[1], color[2])
+
+    # Main line.
+    glLineWidth(3.0)
+    glBegin(GL_LINES)
+    glVertex3f(start_world[0], start_world[1], start_world[2])
+    glVertex3f(end_world[0], end_world[1], end_world[2])
+    glEnd()
+    glLineWidth(1.0)
+
+    # Arrow head.
+    head_len = 0.08
+    head_width = 0.04
+
+    tmp = np.array([0.0, 0.0, 1.0])
+    if abs(np.dot(direction, tmp)) > 0.9:
+        tmp = np.array([0.0, 1.0, 0.0])
+
+    side1 = norm(np.cross(direction, tmp))
+    side2 = norm(np.cross(direction, side1))
+
+    base = end_world - direction * head_len
+
+    p1 = base + side1 * head_width
+    p2 = base - side1 * head_width
+    p3 = base + side2 * head_width
+    p4 = base - side2 * head_width
+
+    glBegin(GL_LINES)
+
+    for p in [p1, p2, p3, p4]:
+        glVertex3f(end_world[0], end_world[1], end_world[2])
+        glVertex3f(p[0], p[1], p[2])
+
+    glEnd()
+
+
+def draw_force_arrows(aircraft):
+    """
+    Draw exact forces used in physics simulation.
+
+    Each arrow comes directly from aircraft.force_debug.
+
+    Everything is WORLD frame:
+        start_world
+        force_world
+
+    Colors:
+        gravity = red
+        lift    = green
+        drag    = magenta
+        thrust  = orange
+    """
+
+    if not DRAW_FORCE_ARROWS:
+        return
+
+    for info in aircraft.force_debug:
+        start_world = info["start_world"]
+        force_world = info["force_world"]
+        color = info["color"]
+
+        draw_arrow_world(
+            start_world,
+            force_world,
+            FORCE_ARROW_SCALE,
+            color=color
+        )
+
+
 def draw_box(size):
     sx, sy, sz = size[0] / 2, size[1] / 2, size[2] / 2
 
     vertices = [
-        [-sx, -sy, -sz], [ sx, -sy, -sz], [ sx,  sy, -sz], [-sx,  sy, -sz],
-        [-sx, -sy,  sz], [ sx, -sy,  sz], [ sx,  sy,  sz], [-sx,  sy,  sz]
+        [-sx, -sy, -sz],
+        [ sx, -sy, -sz],
+        [ sx,  sy, -sz],
+        [-sx,  sy, -sz],
+        [-sx, -sy,  sz],
+        [ sx, -sy,  sz],
+        [ sx,  sy,  sz],
+        [-sx,  sy,  sz]
     ]
 
     faces = [
@@ -751,14 +1025,29 @@ def draw_aircraft(aircraft):
     M[:3, :3] = R
     M[:3, 3] = aircraft.pos
 
+    # ========================================================
+    # Draw aircraft body in aircraft/body coordinates
+    # ========================================================
+
     glPushMatrix()
     glMultMatrixf(M.T)
 
-    # Origin marker
+    # Origin marker.
     glColor3f(1.0, 1.0, 0.0)
     draw_box([0.05, 0.05, 0.05])
 
-    # Tail joint / V-tail root connector
+    # CG marker.
+    glPushMatrix()
+    glTranslatef(
+        aircraft.cg_body[0],
+        aircraft.cg_body[1],
+        aircraft.cg_body[2]
+    )
+    glColor3f(1.0, 0.4, 0.0)
+    draw_box([0.045, 0.045, 0.045])
+    glPopMatrix()
+
+    # Tail joint / V-tail root connector.
     glPushMatrix()
     glTranslatef(TAIL_ROOT_X, 0.0, TAIL_ROOT_Z)
     glColor3f(0.8, 0.8, 0.8)
@@ -788,7 +1077,6 @@ def draw_aircraft(aircraft):
             draw_wing(span=0.65, chord=0.18)
 
         elif p.name == "left_tail":
-            # 30 deg = green, 45 deg = orange
             if aircraft.tail_angle_deg < 40.0:
                 glColor3f(0.2, 0.9, 0.4)
             else:
@@ -799,7 +1087,6 @@ def draw_aircraft(aircraft):
             draw_wing(span=TAIL_SPAN_M, chord=0.12)
 
         elif p.name == "right_tail":
-            # 30 deg = green, 45 deg = orange
             if aircraft.tail_angle_deg < 40.0:
                 glColor3f(0.2, 0.9, 0.4)
             else:
@@ -812,6 +1099,14 @@ def draw_aircraft(aircraft):
         glPopMatrix()
 
     glPopMatrix()
+
+    # ========================================================
+    # Draw force arrows in WORLD coordinates
+    # ========================================================
+    #
+    # This is deliberately outside the aircraft body transform.
+    # Therefore gravity will not rotate with the aircraft.
+    draw_force_arrows(aircraft)
 
 
 def draw_ground():
@@ -842,22 +1137,71 @@ def setup_opengl(width, height):
 
 
 def set_camera(aircraft):
+    """
+    Camera follows the aircraft position and forward direction,
+    but it does NOT roll with the aircraft.
+
+    Important:
+    world_up = [0, 0, 1]
+
+    This prevents world-down gravity from visually looking like
+    aircraft-backward gravity.
+    """
+
     glMatrixMode(GL_MODELVIEW)
     glLoadIdentity()
 
     R = quat_to_rotmat(aircraft.q)
 
     forward = R @ np.array([1.0, 0.0, 0.0])
-    up = R @ np.array([0.0, 0.0, 1.0])
 
     target = aircraft.pos
+
+    # Follow behind aircraft, but keep camera world-up.
     cam_pos = aircraft.pos - forward * 5.0 + np.array([0.0, 0.0, 2.0])
+
+    world_up = np.array([0.0, 0.0, 1.0])
 
     gluLookAt(
         cam_pos[0], cam_pos[1], cam_pos[2],
         target[0], target[1], target[2],
-        up[0], up[1], up[2]
+        world_up[0], world_up[1], world_up[2]
     )
+
+
+# ============================================================
+# Debug print
+# ============================================================
+
+def print_force_summary(aircraft, frame_count):
+    """
+    Print force magnitude summary occasionally.
+    This helps verify that OpenGL arrows match simulated forces.
+
+    Gravity should always print as:
+        [0.000, 0.000, negative]
+    """
+
+    if frame_count % 60 != 0:
+        return
+
+    print("\n" + "-" * 88)
+    print("FORCE SUMMARY, WORLD COORDINATES")
+    print("-" * 88)
+
+    for info in aircraft.force_debug:
+        name = info["name"]
+        part_name = info["part_name"]
+        F = info["force_world"]
+        mag = np.linalg.norm(F)
+
+        print(
+            f"{part_name:12s} | {name:8s} | "
+            f"F_world = [{F[0]:8.3f}, {F[1]:8.3f}, {F[2]:8.3f}] N | "
+            f"|F| = {mag:8.3f} N"
+        )
+
+    print("-" * 88)
 
 
 # ============================================================
@@ -865,13 +1209,15 @@ def set_camera(aircraft):
 # ============================================================
 
 def main():
+    global DRAW_FORCE_ARROWS
+
     print_vtail_angle_comparison()
 
     pygame.init()
 
     width, height = 1200, 800
     pygame.display.set_mode((width, height), DOUBLEBUF | OPENGL)
-    pygame.display.set_caption("Flow5 Table Driven Aircraft Simulation with Switchable V-Tail")
+    pygame.display.set_caption("Aircraft Simulation: World-Coordinate Force Arrows")
 
     setup_opengl(width, height)
 
@@ -880,10 +1226,12 @@ def main():
 
     running = True
     accumulator = 0.0
+    frame_count = 0
 
     while running:
         frame_dt = clock.tick(60) / 1000.0
         accumulator += frame_dt
+        frame_count += 1
 
         for event in pygame.event.get():
             if event.type == QUIT:
@@ -902,6 +1250,10 @@ def main():
                 if event.key == K_4:
                     aircraft.set_tail_angle(45.0)
 
+                if event.key == K_f:
+                    DRAW_FORCE_ARROWS = not DRAW_FORCE_ARROWS
+                    print(f"DRAW_FORCE_ARROWS = {DRAW_FORCE_ARROWS}")
+
         keys = pygame.key.get_pressed()
         aircraft.apply_controls(keys, frame_dt)
 
@@ -917,12 +1269,16 @@ def main():
 
         pygame.display.flip()
 
+        print_force_summary(aircraft, frame_count)
+
         R = quat_to_rotmat(aircraft.q)
         roll, pitch, yaw = euler_from_rotmat(R)
         speed = np.linalg.norm(aircraft.vel)
 
         pygame.display.set_caption(
+            f"WORLD FORCE ARROWS | "
             f"tail={aircraft.tail_angle_deg:4.1f} deg | "
+            f"force_arrows={DRAW_FORCE_ARROWS} | "
             f"speed={speed:5.2f} m/s | "
             f"alt={aircraft.pos[2]:5.2f} m | "
             f"thr={aircraft.throttle:4.2f} | "
