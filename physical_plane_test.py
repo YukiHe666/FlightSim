@@ -1,5 +1,7 @@
 import math
+import re
 import numpy as np
+import pandas as pd
 import pygame
 from pygame.locals import *
 
@@ -8,12 +10,13 @@ from OpenGL.GLU import *
 
 
 # ============================================================
-# Basic constants
+# Constants
 # ============================================================
 
 G = 9.81
-RHO = 1.225          # air density at sea level, kg/m^3
-DT = 0.005          # physics timestep, seconds
+RHO = 1.225
+MU_AIR = 1.81e-5
+DT = 0.005
 
 DEG2RAD = math.pi / 180.0
 RAD2DEG = 180.0 / math.pi
@@ -34,21 +37,16 @@ def clamp(x, lo, hi):
     return max(lo, min(hi, x))
 
 
-def skew(v):
-    return np.array([
-        [0, -v[2], v[1]],
-        [v[2], 0, -v[0]],
-        [-v[1], v[0], 0]
-    ], dtype=float)
-
-
 # ============================================================
 # Quaternion helpers
 # q = [w, x, y, z]
 # ============================================================
 
 def quat_normalize(q):
-    return q / np.linalg.norm(q)
+    n = np.linalg.norm(q)
+    if n < 1e-9:
+        return np.array([1.0, 0.0, 0.0, 0.0])
+    return q / n
 
 
 def quat_multiply(q1, q2):
@@ -75,24 +73,121 @@ def quat_to_rotmat(q):
 
 
 def integrate_quaternion(q, omega_body, dt):
-    """
-    omega_body is angular velocity in body frame, rad/s.
-    q_dot = 0.5 * q * [0, omega]
-    """
     omega_q = np.array([0.0, omega_body[0], omega_body[1], omega_body[2]])
     q_dot = 0.5 * quat_multiply(q, omega_q)
     return quat_normalize(q + q_dot * dt)
 
 
 def euler_from_rotmat(R):
-    """
-    Return roll, pitch, yaw in degrees.
-    Approximate aerospace convention.
-    """
     pitch = math.asin(clamp(-R[2, 0], -1.0, 1.0))
     roll = math.atan2(R[2, 1], R[2, 2])
     yaw = math.atan2(R[1, 0], R[0, 0])
+
     return roll * RAD2DEG, pitch * RAD2DEG, yaw * RAD2DEG
+
+
+# ============================================================
+# Flow5 polar table reader
+# ============================================================
+
+class Flow5PolarTable:
+    def __init__(self, cl_csv_path, cd_csv_path):
+        self.CL_data = self._load_one_table(cl_csv_path)
+        self.CD_data = self._load_one_table(cd_csv_path)
+
+        self.re_values = sorted(
+            set(self.CL_data.keys()).intersection(set(self.CD_data.keys()))
+        )
+
+        if len(self.re_values) == 0:
+            raise ValueError("No matching Reynolds number found between CL and CD tables.")
+
+        print("Loaded Flow5 polar data:")
+        for Re in self.re_values:
+            print(f"  Re = {Re:.0f}")
+
+    def _extract_re_from_name(self, name):
+        match = re.search(r"Re([0-9.]+)", str(name))
+        if match is None:
+            return None
+
+        re_million = float(match.group(1))
+        return re_million * 1_000_000.0
+
+    def _load_one_table(self, csv_path):
+        df = pd.read_csv(csv_path)
+        cols = list(df.columns)
+
+        data = {}
+
+        for i in range(0, len(cols) - 1, 2):
+            alpha_col = cols[i]
+            value_col = cols[i + 1]
+
+            Re = self._extract_re_from_name(value_col)
+            if Re is None:
+                continue
+
+            alpha = pd.to_numeric(df[alpha_col], errors="coerce").to_numpy()
+            value = pd.to_numeric(df[value_col], errors="coerce").to_numpy()
+
+            valid = np.isfinite(alpha) & np.isfinite(value)
+            alpha = alpha[valid]
+            value = value[valid]
+
+            if len(alpha) < 2:
+                continue
+
+            order = np.argsort(alpha)
+            alpha = alpha[order]
+            value = value[order]
+
+            data[Re] = {
+                "alpha": alpha,
+                "value": value
+            }
+
+        return data
+
+    def _lookup_single_table(self, table, Re, alpha_deg):
+        Re = float(Re)
+
+        if Re <= self.re_values[0]:
+            Re_low = self.re_values[0]
+            Re_high = self.re_values[0]
+        elif Re >= self.re_values[-1]:
+            Re_low = self.re_values[-1]
+            Re_high = self.re_values[-1]
+        else:
+            Re_low = self.re_values[0]
+            Re_high = self.re_values[-1]
+
+            for i in range(len(self.re_values) - 1):
+                if self.re_values[i] <= Re <= self.re_values[i + 1]:
+                    Re_low = self.re_values[i]
+                    Re_high = self.re_values[i + 1]
+                    break
+
+        def interp_alpha(Re_table):
+            alpha_table = table[Re_table]["alpha"]
+            value_table = table[Re_table]["value"]
+
+            alpha_used = np.clip(alpha_deg, alpha_table[0], alpha_table[-1])
+            return np.interp(alpha_used, alpha_table, value_table)
+
+        value_low = interp_alpha(Re_low)
+        value_high = interp_alpha(Re_high)
+
+        if Re_low == Re_high:
+            return float(value_low)
+
+        t = (Re - Re_low) / (Re_high - Re_low)
+        return float(value_low + t * (value_high - value_low))
+
+    def lookup(self, Re, alpha_deg):
+        CL = self._lookup_single_table(self.CL_data, Re, alpha_deg)
+        CD = self._lookup_single_table(self.CD_data, Re, alpha_deg)
+        return CL, CD
 
 
 # ============================================================
@@ -107,6 +202,7 @@ class AircraftPart:
         r_body,
         area_m2,
         chord_m,
+        span_m,
         lift_axis_body,
         span_axis_body,
         is_lifting_surface=True,
@@ -115,21 +211,24 @@ class AircraftPart:
         self.name = name
         self.mass = mass_kg
 
-        # Position of the part center relative to aircraft origin in body frame
         self.r_body = np.array(r_body, dtype=float)
 
         self.area = area_m2
         self.chord = chord_m
+        self.span = span_m
 
-        # Body-frame local axes
+        if area_m2 > 1e-9:
+            self.aspect_ratio = span_m * span_m / area_m2
+        else:
+            self.aspect_ratio = 1.0
+
         self.lift_axis_body = norm(np.array(lift_axis_body, dtype=float))
         self.span_axis_body = norm(np.array(span_axis_body, dtype=float))
 
         self.is_lifting_surface = is_lifting_surface
         self.cd0 = cd0
 
-        # Control deflection angle, rad
-        # positive means trailing edge down, increasing effective AoA
+        # Positive deflection means trailing edge down.
         self.deflection = 0.0
 
 
@@ -139,117 +238,114 @@ class AircraftPart:
 
 class Aircraft:
     def __init__(self):
+        self.airfoil_table = Flow5PolarTable(
+            cl_csv_path="CL&α_Polar_Graph.csv",
+            cd_csv_path="Cd&α_Polar_Graph.csv"
+        )
+
         self.parts = []
 
-        # ------------------------------------------------------------
-        # Coordinate definition:
-        # body +x = nose direction
-        # body +y = right wing direction
-        # body +z = upward
+        # Body frame:
+        # +x = nose direction
+        # +y = aircraft right
+        # +z = aircraft upward
         #
-        # origin = rod-fuselage connection point
-        # ------------------------------------------------------------
+        # Origin = connection point between fuselage and rod
 
-        # Fuselage, 1 kg, located forward of origin
         self.parts.append(AircraftPart(
             name="fuselage",
-            mass_kg=1.0,
+            mass_kg=2.0,
             r_body=[0.25, 0.0, 0.0],
             area_m2=0.035,
             chord_m=0.50,
+            span_m=0.12,
             lift_axis_body=[0, 0, 1],
             span_axis_body=[0, 1, 0],
             is_lifting_surface=False,
             cd0=0.12
         ))
 
-        # Rod / tail boom, 0.1 kg, located behind origin
         self.parts.append(AircraftPart(
             name="rod",
             mass_kg=0.1,
             r_body=[-0.45, 0.0, 0.0],
             area_m2=0.010,
             chord_m=0.90,
+            span_m=0.035,
             lift_axis_body=[0, 0, 1],
             span_axis_body=[0, 1, 0],
             is_lifting_surface=False,
             cd0=0.08
         ))
 
-        # Left wing, 250 g
         self.left_wing = AircraftPart(
             name="left_wing",
             mass_kg=0.25,
             r_body=[0.05, -0.35, 0.0],
             area_m2=0.075,
             chord_m=0.18,
+            span_m=0.65,
             lift_axis_body=[0, 0, 1],
             span_axis_body=[0, -1, 0],
             is_lifting_surface=True,
             cd0=0.035
         )
 
-        # Right wing, 250 g
         self.right_wing = AircraftPart(
             name="right_wing",
             mass_kg=0.25,
             r_body=[0.05, 0.35, 0.0],
             area_m2=0.075,
             chord_m=0.18,
+            span_m=0.65,
             lift_axis_body=[0, 0, 1],
             span_axis_body=[0, 1, 0],
             is_lifting_surface=True,
             cd0=0.035
         )
 
-        self.parts.append(self.left_wing)
-        self.parts.append(self.right_wing)
-
-        # Left tail wing, 100 g
         self.left_tail = AircraftPart(
             name="left_tail",
             mass_kg=0.1,
             r_body=[-0.90, -0.18, 0.02],
             area_m2=0.030,
             chord_m=0.12,
+            span_m=0.32,
             lift_axis_body=[0, 0, 1],
             span_axis_body=[0, -1, 0],
             is_lifting_surface=True,
             cd0=0.04
         )
 
-        # Right tail wing, 100 g
         self.right_tail = AircraftPart(
             name="right_tail",
             mass_kg=0.1,
             r_body=[-0.90, 0.18, 0.02],
             area_m2=0.030,
             chord_m=0.12,
+            span_m=0.32,
             lift_axis_body=[0, 0, 1],
             span_axis_body=[0, 1, 0],
             is_lifting_surface=True,
             cd0=0.04
         )
 
+        self.parts.append(self.left_wing)
+        self.parts.append(self.right_wing)
         self.parts.append(self.left_tail)
         self.parts.append(self.right_tail)
 
         self.mass = sum(p.mass for p in self.parts)
 
-        # Initial state in world frame
         self.pos = np.array([0.0, 0.0, 20.0], dtype=float)
         self.vel = np.array([18.0, 0.0, 0.0], dtype=float)
 
-        # Quaternion: body to world
         self.q = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
-
-        # Angular velocity in body frame, rad/s
         self.omega_body = np.array([0.0, 0.0, 0.0], dtype=float)
 
         self.throttle = 0.45
         self.max_thrust = 12.0
 
-        # Calculate inertia tensor around aircraft origin
         self.I_body = self.compute_inertia_tensor()
         self.I_body_inv = np.linalg.inv(self.I_body)
 
@@ -267,11 +363,6 @@ class Aircraft:
         self.throttle = 0.45
 
     def compute_inertia_tensor(self):
-        """
-        Approximate each part as a point mass at r_body.
-        I = sum m * (|r|^2 I3 - r r^T)
-        Add small diagonal terms to avoid singular matrix.
-        """
         I = np.zeros((3, 3), dtype=float)
 
         for p in self.parts:
@@ -279,18 +370,18 @@ class Aircraft:
             I += p.mass * ((np.dot(r, r) * np.eye(3)) - np.outer(r, r))
 
         I += np.diag([0.02, 0.08, 0.08])
+
         return I
 
     def apply_controls(self, keys, dt):
-        flap_rate = 75.0 * DEG2RAD
-        max_flap = 30.0 * DEG2RAD
+        # Reduced sensitivity
+        flap_rate = 30.0 * DEG2RAD
+        max_flap = 12.0 * DEG2RAD
 
         left_cmd = 0.0
         right_cmd = 0.0
 
         # W: both wings down
-        # Positive deflection means trailing edge down,
-        # increasing effective angle of attack and lift.
         if keys[K_w]:
             left_cmd += flap_rate
             right_cmd += flap_rate
@@ -300,16 +391,17 @@ class Aircraft:
             left_cmd -= flap_rate
             right_cmd -= flap_rate
 
-        # A: left wing up, right wing down
-        # This creates differential lift and roll torque.
+        # A: turn left
+        # left wing down, right wing up
         if keys[K_a]:
-            left_cmd -= flap_rate
-            right_cmd += flap_rate
-
-        # D: left wing down, right wing up
-        if keys[K_d]:
             left_cmd += flap_rate
             right_cmd -= flap_rate
+
+        # D: turn right
+        # left wing up, right wing down
+        if keys[K_d]:
+            left_cmd -= flap_rate
+            right_cmd += flap_rate
 
         self.left_wing.deflection += left_cmd * dt
         self.right_wing.deflection += right_cmd * dt
@@ -317,8 +409,7 @@ class Aircraft:
         self.left_wing.deflection = clamp(self.left_wing.deflection, -max_flap, max_flap)
         self.right_wing.deflection = clamp(self.right_wing.deflection, -max_flap, max_flap)
 
-        # Tail follows mild pitch stabilization.
-        # You can remove this if you want the aircraft to be completely manual.
+        # Tail surfaces are passive here.
         self.left_tail.deflection *= 0.98
         self.right_tail.deflection *= 0.98
 
@@ -327,108 +418,69 @@ class Aircraft:
             self.throttle += 0.5 * dt
         if keys[K_DOWN]:
             self.throttle -= 0.5 * dt
+
         self.throttle = clamp(self.throttle, 0.0, 1.0)
 
-        # Slowly return wing deflection to neutral if no key is pressed
+        # Faster return to neutral when no key is pressed
         if not (keys[K_w] or keys[K_s] or keys[K_a] or keys[K_d]):
-            self.left_wing.deflection *= 0.985
-            self.right_wing.deflection *= 0.985
+            self.left_wing.deflection *= 0.95
+            self.right_wing.deflection *= 0.95
 
     def compute_part_forces(self, part, R):
-        """
-        Compute force on one part.
-
-        Return:
-            F_world: force in world frame
-            tau_body: torque around aircraft origin in body frame
-        """
-
-        # Position of part in world frame
         r_world = R @ part.r_body
-
-        # Angular velocity in world frame
         omega_world = R @ self.omega_body
 
-        # Velocity of this part due to translation + rotation
         v_part_world = self.vel + np.cross(omega_world, r_world)
-
         speed = np.linalg.norm(v_part_world)
 
-        if speed < 0.1:
-            v_hat_world = np.zeros(3)
-        else:
+        if speed > 0.1:
             v_hat_world = v_part_world / speed
+        else:
+            v_hat_world = np.zeros(3)
 
-        # -----------------------------
         # Gravity
-        # -----------------------------
         F_gravity_world = np.array([0.0, 0.0, -part.mass * G])
 
-        # -----------------------------
-        # Drag
-        # -----------------------------
-        # Drag always opposes local velocity.
-        # For non-lifting parts, use simple quadratic drag.
+        # Basic drag for every part
         F_drag_world = np.zeros(3)
-
         if speed > 0.1:
             q_dyn = 0.5 * RHO * speed * speed
-            Cd_body = part.cd0
-            F_drag_world = -q_dyn * Cd_body * part.area * v_hat_world
+            F_drag_world = -q_dyn * part.cd0 * part.area * v_hat_world
 
-        # -----------------------------
-        # Lift
-        # -----------------------------
         F_lift_world = np.zeros(3)
 
         if part.is_lifting_surface and speed > 0.1:
-            # Convert velocity to body frame
             v_body = R.T @ v_part_world
 
-            # Forward axis is body +x.
-            # Up axis is body +z.
-            # AoA is approximately atan2(-vz, vx).
-            #
-            # If aircraft moves forward and air comes from front,
-            # local relative wind is opposite velocity.
-            # This simplified formula gives positive AoA when nose is pitched up.
             vx = v_body[0]
             vz = v_body[2]
 
             alpha = math.atan2(-vz, max(abs(vx), 1e-3))
 
-            # Wing deflection changes effective angle of attack.
-            # Positive flap down increases effective alpha.
             alpha_eff = alpha + part.deflection
+            alpha_eff_deg = alpha_eff * RAD2DEG
 
-            # Thin airfoil approximation:
-            # CL = 2*pi*alpha
-            # Stall clamp prevents unrealistic infinite lift.
-            alpha_eff = clamp(alpha_eff, -25.0 * DEG2RAD, 25.0 * DEG2RAD)
-            CL = 2.0 * math.pi * alpha_eff
-            CL = clamp(CL, -1.4, 1.4)
+            Re = RHO * speed * part.chord / MU_AIR
 
-            # Induced drag approximation
-            AR = 4.5
+            CL_2D, CD_2D = self.airfoil_table.lookup(Re, alpha_eff_deg)
+
+            AR = max(part.aspect_ratio, 0.1)
             e = 0.75
-            k = 1.0 / (math.pi * e * AR)
-            CD = part.cd0 + k * CL * CL
+
+            CL = CL_2D / (1.0 + abs(CL_2D) / (math.pi * e * AR))
+            CD_induced = CL * CL / (math.pi * e * AR)
+            CD = CD_2D + CD_induced
 
             q_dyn = 0.5 * RHO * speed * speed
 
-            # Drag update for lifting surface
             F_drag_world = -q_dyn * CD * part.area * v_hat_world
 
-            # Lift direction:
-            # mostly perpendicular to velocity and span.
             span_world = R @ part.span_axis_body
-
-            # lift direction = span x velocity direction
-            # choose sign so that lift roughly points along body +z when level flight
             lift_dir_world = np.cross(span_world, v_hat_world)
             lift_dir_world = norm(lift_dir_world)
 
             body_up_world = R @ np.array([0.0, 0.0, 1.0])
+
             if np.dot(lift_dir_world, body_up_world) < 0:
                 lift_dir_world = -lift_dir_world
 
@@ -436,7 +488,6 @@ class Aircraft:
 
         F_total_world = F_gravity_world + F_drag_world + F_lift_world
 
-        # Convert force to body frame for torque calculation
         F_body = R.T @ F_total_world
         tau_body = np.cross(part.r_body, F_body)
 
@@ -448,17 +499,12 @@ class Aircraft:
         F_total_world = np.zeros(3)
         tau_total_body = np.zeros(3)
 
-        # Sum all part forces
         for part in self.parts:
             F_world, tau_body = self.compute_part_forces(part, R)
             F_total_world += F_world
             tau_total_body += tau_body
 
-        # -----------------------------
-        # Thrust
-        # -----------------------------
-        # Thrust acts along body +x.
-        # Apply it near fuselage/nose.
+        # Thrust along body +x
         thrust_body = np.array([self.max_thrust * self.throttle, 0.0, 0.0])
         thrust_world = R @ thrust_body
 
@@ -468,41 +514,31 @@ class Aircraft:
         F_total_world += thrust_world
         tau_total_body += thrust_tau_body
 
-        # -----------------------------
-        # Angular damping
-        # -----------------------------
-        # This is physical-like aerodynamic damping.
-        # It prevents the simulation from becoming numerically unstable.
-        tau_total_body += -0.15 * self.omega_body
+        # Increased angular damping
+        tau_total_body += -0.45 * self.omega_body
 
         return F_total_world, tau_total_body
 
     def step(self, dt):
-        R = quat_to_rotmat(self.q)
-
         F_world, tau_body = self.compute_total_forces_and_torques()
 
-        # -----------------------------
         # Linear dynamics
-        # -----------------------------
         acc_world = F_world / self.mass
 
         self.vel += acc_world * dt
         self.pos += self.vel * dt
 
-        # Ground collision
+        # Simple ground collision
         if self.pos[2] < 0.3:
             self.pos[2] = 0.3
+
             if self.vel[2] < 0:
                 self.vel[2] *= -0.15
+
             self.vel[0] *= 0.96
             self.vel[1] *= 0.96
 
-        # -----------------------------
         # Rotational dynamics
-        # Euler equation:
-        # I * omega_dot + omega x Iomega = tau
-        # -----------------------------
         I = self.I_body
         Iomega = I @ self.omega_body
 
@@ -512,18 +548,18 @@ class Aircraft:
 
         self.omega_body += omega_dot * dt
 
-        # Limit angular velocity to avoid numerical explosion
-        max_omega = 8.0
+        # Reduced maximum angular velocity
+        max_omega = 3.0
         wmag = np.linalg.norm(self.omega_body)
+
         if wmag > max_omega:
             self.omega_body = self.omega_body / wmag * max_omega
 
-        # Update orientation
         self.q = integrate_quaternion(self.q, self.omega_body, dt)
 
 
 # ============================================================
-# OpenGL drawing helpers
+# OpenGL drawing
 # ============================================================
 
 def draw_box(size):
@@ -544,8 +580,8 @@ def draw_box(size):
     ]
 
     glBegin(GL_QUADS)
-    for f in faces:
-        for idx in f:
+    for face in faces:
+        for idx in face:
             glVertex3fv(vertices[idx])
     glEnd()
 
@@ -557,7 +593,6 @@ def draw_wing(span, chord, thickness=0.02):
 def draw_aircraft(aircraft):
     R = quat_to_rotmat(aircraft.q)
 
-    # Convert rotation matrix to OpenGL 4x4 matrix
     M = np.eye(4)
     M[:3, :3] = R
     M[:3, 3] = aircraft.pos
@@ -565,11 +600,10 @@ def draw_aircraft(aircraft):
     glPushMatrix()
     glMultMatrixf(M.T)
 
-    # Draw origin marker
+    # Origin marker
     glColor3f(1.0, 1.0, 0.0)
     draw_box([0.05, 0.05, 0.05])
 
-    # Draw each part in body frame
     for p in aircraft.parts:
         glPushMatrix()
         glTranslatef(p.r_body[0], p.r_body[1], p.r_body[2])
@@ -609,10 +643,12 @@ def draw_aircraft(aircraft):
 
 def draw_ground():
     glColor3f(0.25, 0.25, 0.25)
+
     glBegin(GL_LINES)
     for i in range(-50, 51):
         glVertex3f(i, -50, 0)
         glVertex3f(i, 50, 0)
+
         glVertex3f(-50, i, 0)
         glVertex3f(50, i, 0)
     glEnd()
@@ -620,8 +656,10 @@ def draw_ground():
 
 def setup_opengl(width, height):
     glViewport(0, 0, width, height)
+
     glMatrixMode(GL_PROJECTION)
     glLoadIdentity()
+
     gluPerspective(60.0, width / height, 0.1, 1000.0)
 
     glMatrixMode(GL_MODELVIEW)
@@ -658,7 +696,7 @@ def main():
 
     width, height = 1200, 800
     pygame.display.set_mode((width, height), DOUBLEBUF | OPENGL)
-    pygame.display.set_caption("Rigid Body Aircraft Physics Simulation")
+    pygame.display.set_caption("Flow5 Table Driven Aircraft Simulation")
 
     setup_opengl(width, height)
 
@@ -667,8 +705,6 @@ def main():
 
     running = True
     accumulator = 0.0
-
-    font = pygame.font.SysFont("Consolas", 18)
 
     while running:
         frame_dt = clock.tick(60) / 1000.0
@@ -681,6 +717,7 @@ def main():
             if event.type == KEYDOWN:
                 if event.key == K_ESCAPE:
                     running = False
+
                 if event.key == K_r:
                     aircraft.reset()
 
@@ -704,11 +741,14 @@ def main():
         speed = np.linalg.norm(aircraft.vel)
 
         pygame.display.set_caption(
-            f"speed={speed:5.2f} m/s | alt={aircraft.pos[2]:5.2f} m | "
+            f"speed={speed:5.2f} m/s | "
+            f"alt={aircraft.pos[2]:5.2f} m | "
             f"thr={aircraft.throttle:4.2f} | "
-            f"roll={roll:6.2f} deg | pitch={pitch:6.2f} deg | yaw={yaw:6.2f} deg | "
-            f"L flap={aircraft.left_wing.deflection * RAD2DEG:6.2f} | "
-            f"R flap={aircraft.right_wing.deflection * RAD2DEG:6.2f}"
+            f"roll={roll:6.2f} deg | "
+            f"pitch={pitch:6.2f} deg | "
+            f"yaw={yaw:6.2f} deg | "
+            f"L flap={aircraft.left_wing.deflection * RAD2DEG:6.2f} deg | "
+            f"R flap={aircraft.right_wing.deflection * RAD2DEG:6.2f} deg"
         )
 
     pygame.quit()
