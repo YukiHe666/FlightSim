@@ -21,12 +21,13 @@ DT = 0.005
 DEG2RAD = math.pi / 180.0
 RAD2DEG = 180.0 / math.pi
 
+
 # ============================================================
 # V-tail geometry
 # ============================================================
 
-TAIL_ANGLE_DEG = 45.0
-TAIL_ANGLE_RAD = TAIL_ANGLE_DEG * DEG2RAD
+# Initial tail angle. Press 3 for 30 deg, press 4 for 45 deg.
+TAIL_ANGLE_DEG = 30.0
 
 TAIL_SPAN_M = 0.32
 TAIL_HALF_SPAN_M = TAIL_SPAN_M / 2.0
@@ -36,10 +37,62 @@ TAIL_HALF_SPAN_M = TAIL_SPAN_M / 2.0
 TAIL_ROOT_X = -0.90
 TAIL_ROOT_Z = 0.02
 
-# Tail center position is computed from the root point.
-# This prevents the two V-tail surfaces from being separated.
-TAIL_CENTER_Y = math.cos(TAIL_ANGLE_RAD) * TAIL_HALF_SPAN_M
-TAIL_CENTER_Z = TAIL_ROOT_Z + math.sin(TAIL_ANGLE_RAD) * TAIL_HALF_SPAN_M
+
+# ============================================================
+# V-tail comparison printout
+# ============================================================
+
+def print_vtail_angle_comparison():
+    print("\n" + "=" * 88)
+    print("V-TAIL ANGLE COMPARISON: 30 deg vs 45 deg")
+    print(f"Initial simulation tail angle = {TAIL_ANGLE_DEG:.1f} deg")
+    print("=" * 88)
+
+    print(
+        f"{'Angle':>8} | "
+        f"{'center_y(m)':>11} | "
+        f"{'center_z(m)':>11} | "
+        f"{'vertical lift frac':>18} | "
+        f"{'side force frac':>15} | "
+        f"{'pitch/yaw ratio':>15}"
+    )
+    print("-" * 88)
+
+    for angle_deg in [30.0, 45.0]:
+        angle_rad = angle_deg * DEG2RAD
+
+        center_y = math.cos(angle_rad) * TAIL_HALF_SPAN_M
+        center_z = TAIL_ROOT_Z + math.sin(angle_rad) * TAIL_HALF_SPAN_M
+
+        vertical_lift_fraction = math.cos(angle_rad)
+        side_force_fraction = math.sin(angle_rad)
+
+        if side_force_fraction > 1e-9:
+            pitch_yaw_ratio = vertical_lift_fraction / side_force_fraction
+        else:
+            pitch_yaw_ratio = float("inf")
+
+        print(
+            f"{angle_deg:8.1f} | "
+            f"{center_y:11.4f} | "
+            f"{center_z:11.4f} | "
+            f"{vertical_lift_fraction:18.3f} | "
+            f"{side_force_fraction:15.3f} | "
+            f"{pitch_yaw_ratio:15.3f}"
+        )
+
+    print("-" * 88)
+    print("Interpretation:")
+    print("30 deg: more horizontal-tail-like. Stronger pitch stability.")
+    print("45 deg: balanced pitch and yaw contribution. More standard V-tail-like.")
+    print()
+    print("OpenGL controls:")
+    print("Press 3: switch V-tail to 30 degrees")
+    print("Press 4: switch V-tail to 45 degrees")
+    print("Press R: reset aircraft state")
+    print("W/S: both main wings down/up")
+    print("A/D: left/right turn input")
+    print("=" * 88 + "\n")
 
 
 # ============================================================
@@ -265,6 +318,9 @@ class Aircraft:
 
         self.parts = []
 
+        self.tail_angle_deg = TAIL_ANGLE_DEG
+        self.tail_angle_rad = self.tail_angle_deg * DEG2RAD
+
         # Body frame:
         # +x = nose direction
         # +y = aircraft right
@@ -324,22 +380,17 @@ class Aircraft:
             cd0=0.035
         )
 
-        # ------------------------------------------------------------
-        # 45-degree V-tail
-        #
-        # Important:
-        # r_body is the center of each tail surface, not the root.
-        # We compute the center from the root so that the inner edges
-        # of the two tail surfaces connect at the rod end.
-        # ------------------------------------------------------------
+        # Initial V-tail center and axis
+        tail_center_y = math.cos(self.tail_angle_rad) * TAIL_HALF_SPAN_M
+        tail_center_z = TAIL_ROOT_Z + math.sin(self.tail_angle_rad) * TAIL_HALF_SPAN_M
 
         self.left_tail = AircraftPart(
             name="left_tail",
             mass_kg=0.1,
             r_body=[
                 TAIL_ROOT_X,
-                -TAIL_CENTER_Y,
-                TAIL_CENTER_Z
+                -tail_center_y,
+                tail_center_z
             ],
             area_m2=0.030,
             chord_m=0.12,
@@ -347,8 +398,8 @@ class Aircraft:
             lift_axis_body=[0, 0, 1],
             span_axis_body=[
                 0,
-                -math.cos(TAIL_ANGLE_RAD),
-                math.sin(TAIL_ANGLE_RAD)
+                -math.cos(self.tail_angle_rad),
+                math.sin(self.tail_angle_rad)
             ],
             is_lifting_surface=True,
             cd0=0.04
@@ -359,8 +410,8 @@ class Aircraft:
             mass_kg=0.1,
             r_body=[
                 TAIL_ROOT_X,
-                TAIL_CENTER_Y,
-                TAIL_CENTER_Z
+                tail_center_y,
+                tail_center_z
             ],
             area_m2=0.030,
             chord_m=0.12,
@@ -368,8 +419,8 @@ class Aircraft:
             lift_axis_body=[0, 0, 1],
             span_axis_body=[
                 0,
-                math.cos(TAIL_ANGLE_RAD),
-                math.sin(TAIL_ANGLE_RAD)
+                math.cos(self.tail_angle_rad),
+                math.sin(self.tail_angle_rad)
             ],
             is_lifting_surface=True,
             cd0=0.04
@@ -393,6 +444,63 @@ class Aircraft:
 
         self.I_body = self.compute_inertia_tensor()
         self.I_body_inv = np.linalg.inv(self.I_body)
+
+        self.print_current_tail_angle_data()
+
+    def print_current_tail_angle_data(self):
+        vertical_lift_fraction = math.cos(self.tail_angle_rad)
+        side_force_fraction = math.sin(self.tail_angle_rad)
+
+        if side_force_fraction > 1e-9:
+            pitch_yaw_ratio = vertical_lift_fraction / side_force_fraction
+        else:
+            pitch_yaw_ratio = float("inf")
+
+        print("\n" + "=" * 64)
+        print(f"Current V-tail angle = {self.tail_angle_deg:.1f} deg")
+        print(f"left_tail center  = {self.left_tail.r_body}")
+        print(f"right_tail center = {self.right_tail.r_body}")
+        print(f"vertical lift fraction ≈ {vertical_lift_fraction:.3f}")
+        print(f"side force fraction    ≈ {side_force_fraction:.3f}")
+        print(f"pitch/yaw ratio        ≈ {pitch_yaw_ratio:.3f}")
+        print("=" * 64 + "\n")
+
+    def set_tail_angle(self, angle_deg):
+        self.tail_angle_deg = angle_deg
+        self.tail_angle_rad = angle_deg * DEG2RAD
+
+        tail_center_y = math.cos(self.tail_angle_rad) * TAIL_HALF_SPAN_M
+        tail_center_z = TAIL_ROOT_Z + math.sin(self.tail_angle_rad) * TAIL_HALF_SPAN_M
+
+        self.left_tail.r_body = np.array([
+            TAIL_ROOT_X,
+            -tail_center_y,
+            tail_center_z
+        ], dtype=float)
+
+        self.right_tail.r_body = np.array([
+            TAIL_ROOT_X,
+            tail_center_y,
+            tail_center_z
+        ], dtype=float)
+
+        self.left_tail.span_axis_body = norm(np.array([
+            0,
+            -math.cos(self.tail_angle_rad),
+            math.sin(self.tail_angle_rad)
+        ], dtype=float))
+
+        self.right_tail.span_axis_body = norm(np.array([
+            0,
+            math.cos(self.tail_angle_rad),
+            math.sin(self.tail_angle_rad)
+        ], dtype=float))
+
+        # Geometry changed, so recompute inertia.
+        self.I_body = self.compute_inertia_tensor()
+        self.I_body_inv = np.linalg.inv(self.I_body)
+
+        self.print_current_tail_angle_data()
 
     def reset(self):
         self.pos = np.array([0.0, 0.0, 20.0], dtype=float)
@@ -651,7 +759,6 @@ def draw_aircraft(aircraft):
     draw_box([0.05, 0.05, 0.05])
 
     # Tail joint / V-tail root connector
-    # This visually connects the two V-tail surfaces to the rod end.
     glPushMatrix()
     glTranslatef(TAIL_ROOT_X, 0.0, TAIL_ROOT_Z)
     glColor3f(0.8, 0.8, 0.8)
@@ -681,17 +788,25 @@ def draw_aircraft(aircraft):
             draw_wing(span=0.65, chord=0.18)
 
         elif p.name == "left_tail":
-            # Visual 45-degree V-tail angle
-            glRotatef(-TAIL_ANGLE_DEG, 1, 0, 0)
+            # 30 deg = green, 45 deg = orange
+            if aircraft.tail_angle_deg < 40.0:
+                glColor3f(0.2, 0.9, 0.4)
+            else:
+                glColor3f(1.0, 0.6, 0.1)
+
+            glRotatef(-aircraft.tail_angle_deg, 1, 0, 0)
             glRotatef(p.deflection * RAD2DEG, 0, 1, 0)
-            glColor3f(0.2, 0.9, 0.4)
             draw_wing(span=TAIL_SPAN_M, chord=0.12)
 
         elif p.name == "right_tail":
-            # Visual 45-degree V-tail angle
-            glRotatef(TAIL_ANGLE_DEG, 1, 0, 0)
+            # 30 deg = green, 45 deg = orange
+            if aircraft.tail_angle_deg < 40.0:
+                glColor3f(0.2, 0.9, 0.4)
+            else:
+                glColor3f(1.0, 0.6, 0.1)
+
+            glRotatef(aircraft.tail_angle_deg, 1, 0, 0)
             glRotatef(p.deflection * RAD2DEG, 0, 1, 0)
-            glColor3f(0.2, 0.9, 0.4)
             draw_wing(span=TAIL_SPAN_M, chord=0.12)
 
         glPopMatrix()
@@ -750,11 +865,13 @@ def set_camera(aircraft):
 # ============================================================
 
 def main():
+    print_vtail_angle_comparison()
+
     pygame.init()
 
     width, height = 1200, 800
     pygame.display.set_mode((width, height), DOUBLEBUF | OPENGL)
-    pygame.display.set_caption("Flow5 Table Driven Aircraft Simulation with Connected V-Tail")
+    pygame.display.set_caption("Flow5 Table Driven Aircraft Simulation with Switchable V-Tail")
 
     setup_opengl(width, height)
 
@@ -779,6 +896,12 @@ def main():
                 if event.key == K_r:
                     aircraft.reset()
 
+                if event.key == K_3:
+                    aircraft.set_tail_angle(30.0)
+
+                if event.key == K_4:
+                    aircraft.set_tail_angle(45.0)
+
         keys = pygame.key.get_pressed()
         aircraft.apply_controls(keys, frame_dt)
 
@@ -799,6 +922,7 @@ def main():
         speed = np.linalg.norm(aircraft.vel)
 
         pygame.display.set_caption(
+            f"tail={aircraft.tail_angle_deg:4.1f} deg | "
             f"speed={speed:5.2f} m/s | "
             f"alt={aircraft.pos[2]:5.2f} m | "
             f"thr={aircraft.throttle:4.2f} | "
