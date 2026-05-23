@@ -21,6 +21,26 @@ DT = 0.005
 DEG2RAD = math.pi / 180.0
 RAD2DEG = 180.0 / math.pi
 
+# ============================================================
+# V-tail geometry
+# ============================================================
+
+TAIL_ANGLE_DEG = 45.0
+TAIL_ANGLE_RAD = TAIL_ANGLE_DEG * DEG2RAD
+
+TAIL_SPAN_M = 0.32
+TAIL_HALF_SPAN_M = TAIL_SPAN_M / 2.0
+
+# Rod center is x = -0.45, rod length is 0.90,
+# so the rear end of the rod is approximately x = -0.90.
+TAIL_ROOT_X = -0.90
+TAIL_ROOT_Z = 0.02
+
+# Tail center position is computed from the root point.
+# This prevents the two V-tail surfaces from being separated.
+TAIL_CENTER_Y = math.cos(TAIL_ANGLE_RAD) * TAIL_HALF_SPAN_M
+TAIL_CENTER_Z = TAIL_ROOT_Z + math.sin(TAIL_ANGLE_RAD) * TAIL_HALF_SPAN_M
+
 
 # ============================================================
 # Vector helpers
@@ -250,11 +270,11 @@ class Aircraft:
         # +y = aircraft right
         # +z = aircraft upward
         #
-        # Origin = connection point between fuselage and rod
+        # Origin = connection point between fuselage and rod.
 
         self.parts.append(AircraftPart(
             name="fuselage",
-            mass_kg=2.0,
+            mass_kg=1.0,
             r_body=[0.25, 0.0, 0.0],
             area_m2=0.035,
             chord_m=0.50,
@@ -304,15 +324,32 @@ class Aircraft:
             cd0=0.035
         )
 
+        # ------------------------------------------------------------
+        # 45-degree V-tail
+        #
+        # Important:
+        # r_body is the center of each tail surface, not the root.
+        # We compute the center from the root so that the inner edges
+        # of the two tail surfaces connect at the rod end.
+        # ------------------------------------------------------------
+
         self.left_tail = AircraftPart(
             name="left_tail",
             mass_kg=0.1,
-            r_body=[-0.90, -0.18, 0.02],
+            r_body=[
+                TAIL_ROOT_X,
+                -TAIL_CENTER_Y,
+                TAIL_CENTER_Z
+            ],
             area_m2=0.030,
             chord_m=0.12,
-            span_m=0.32,
+            span_m=TAIL_SPAN_M,
             lift_axis_body=[0, 0, 1],
-            span_axis_body=[0, -1, 0],
+            span_axis_body=[
+                0,
+                -math.cos(TAIL_ANGLE_RAD),
+                math.sin(TAIL_ANGLE_RAD)
+            ],
             is_lifting_surface=True,
             cd0=0.04
         )
@@ -320,12 +357,20 @@ class Aircraft:
         self.right_tail = AircraftPart(
             name="right_tail",
             mass_kg=0.1,
-            r_body=[-0.90, 0.18, 0.02],
+            r_body=[
+                TAIL_ROOT_X,
+                TAIL_CENTER_Y,
+                TAIL_CENTER_Z
+            ],
             area_m2=0.030,
             chord_m=0.12,
-            span_m=0.32,
+            span_m=TAIL_SPAN_M,
             lift_axis_body=[0, 0, 1],
-            span_axis_body=[0, 1, 0],
+            span_axis_body=[
+                0,
+                math.cos(TAIL_ANGLE_RAD),
+                math.sin(TAIL_ANGLE_RAD)
+            ],
             is_lifting_surface=True,
             cd0=0.04
         )
@@ -381,12 +426,12 @@ class Aircraft:
         left_cmd = 0.0
         right_cmd = 0.0
 
-        # W: both wings down
+        # W: both main wings down
         if keys[K_w]:
             left_cmd += flap_rate
             right_cmd += flap_rate
 
-        # S: both wings up
+        # S: both main wings up
         if keys[K_s]:
             left_cmd -= flap_rate
             right_cmd -= flap_rate
@@ -475,6 +520,7 @@ class Aircraft:
 
             F_drag_world = -q_dyn * CD * part.area * v_hat_world
 
+            # Lift direction is perpendicular to velocity and span direction.
             span_world = R @ part.span_axis_body
             lift_dir_world = np.cross(span_world, v_hat_world)
             lift_dir_world = norm(lift_dir_world)
@@ -604,6 +650,14 @@ def draw_aircraft(aircraft):
     glColor3f(1.0, 1.0, 0.0)
     draw_box([0.05, 0.05, 0.05])
 
+    # Tail joint / V-tail root connector
+    # This visually connects the two V-tail surfaces to the rod end.
+    glPushMatrix()
+    glTranslatef(TAIL_ROOT_X, 0.0, TAIL_ROOT_Z)
+    glColor3f(0.8, 0.8, 0.8)
+    draw_box([0.08, 0.08, 0.08])
+    glPopMatrix()
+
     for p in aircraft.parts:
         glPushMatrix()
         glTranslatef(p.r_body[0], p.r_body[1], p.r_body[2])
@@ -627,14 +681,18 @@ def draw_aircraft(aircraft):
             draw_wing(span=0.65, chord=0.18)
 
         elif p.name == "left_tail":
+            # Visual 45-degree V-tail angle
+            glRotatef(-TAIL_ANGLE_DEG, 1, 0, 0)
             glRotatef(p.deflection * RAD2DEG, 0, 1, 0)
             glColor3f(0.2, 0.9, 0.4)
-            draw_wing(span=0.32, chord=0.12)
+            draw_wing(span=TAIL_SPAN_M, chord=0.12)
 
         elif p.name == "right_tail":
+            # Visual 45-degree V-tail angle
+            glRotatef(TAIL_ANGLE_DEG, 1, 0, 0)
             glRotatef(p.deflection * RAD2DEG, 0, 1, 0)
             glColor3f(0.2, 0.9, 0.4)
-            draw_wing(span=0.32, chord=0.12)
+            draw_wing(span=TAIL_SPAN_M, chord=0.12)
 
         glPopMatrix()
 
@@ -696,7 +754,7 @@ def main():
 
     width, height = 1200, 800
     pygame.display.set_mode((width, height), DOUBLEBUF | OPENGL)
-    pygame.display.set_caption("Flow5 Table Driven Aircraft Simulation")
+    pygame.display.set_caption("Flow5 Table Driven Aircraft Simulation with Connected V-Tail")
 
     setup_opengl(width, height)
 
